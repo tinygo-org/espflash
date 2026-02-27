@@ -84,6 +84,12 @@ type chipDef struct {
 	// BootloaderFlashOffset is where the bootloader image lives in flash.
 	BootloaderFlashOffset uint32
 
+	// SupportsEncryptedFlash indicates that the ROM bootloader supports
+	// the encrypted flash parameter (5th param) in flash_begin and
+	// flash_defl_begin commands. ESP32-S2 and newer chips support this.
+	// ESP8266 and original ESP32 do not.
+	SupportsEncryptedFlash bool
+
 	// FlashFrequency maps frequency strings to register values.
 	FlashFrequency map[string]byte
 
@@ -155,18 +161,18 @@ func detectChipByMagic(magic uint32) *chipDef {
 	return nil
 }
 
-// defaultFlashSizes returns the standard flash size map used by most chips.
+// defaultFlashSizes returns the standard flash size map for ESP32 and newer chips.
+// Values are the upper nibble of image header byte 3 (pre-shifted).
+// Byte 3 format: (flash_size << 4) | flash_freq.
 func defaultFlashSizes() map[string]byte {
 	return map[string]byte{
-		"256KB": 0x12,
-		"512KB": 0x13,
-		"1MB":   0x14,
-		"2MB":   0x15,
-		"4MB":   0x16,
-		"8MB":   0x17,
-		"16MB":  0x18,
-		"32MB":  0x19,
-		"64MB":  0x1A,
-		"128MB": 0x21,
+		"1MB":   0x00,
+		"2MB":   0x10,
+		"4MB":   0x20,
+		"8MB":   0x30,
+		"16MB":  0x40,
+		"32MB":  0x50,
+		"64MB":  0x60,
+		"128MB": 0x70,
 	}
 }

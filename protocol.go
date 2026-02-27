@@ -77,6 +77,10 @@ type conn struct {
 	port   serial.Port
 	reader *slipReader
 	isStub bool
+	// supportsEncryptedFlash indicates the ROM supports the 5th parameter
+	// (encrypted flag) in flash_begin/flash_defl_begin commands.
+	// Set based on chip type after detection.
+	supportsEncryptedFlash bool
 }
 
 // newConn creates a new protocol connection over the given serial port.
@@ -318,14 +322,19 @@ func (c *conn) flashBegin(size, offset uint32, encrypted bool) error {
 
 	timeout := eraseTimeoutForSize(size)
 
-	// 5 params for newer chips, 4 for ESP8266/ESP32 ROM
-	paramLen := 20
+	// ESP32-S2 and newer ROM bootloaders support a 5th parameter (encrypted
+	// flag). ESP8266 and original ESP32 ROM only accept 4 parameters (16 bytes).
+	// Sending 20 bytes to those older ROMs causes error 0x05 (invalid message).
+	paramLen := 16
+	if c.supportsEncryptedFlash || c.isStub {
+		paramLen = 20
+	}
 	data := make([]byte, paramLen)
 	binary.LittleEndian.PutUint32(data[0:4], eraseSize)
 	binary.LittleEndian.PutUint32(data[4:8], numBlocks)
 	binary.LittleEndian.PutUint32(data[8:12], writeSize)
 	binary.LittleEndian.PutUint32(data[12:16], offset)
-	if encrypted {
+	if paramLen == 20 && encrypted {
 		binary.LittleEndian.PutUint32(data[16:20], 1)
 	}
 
@@ -372,12 +381,18 @@ func (c *conn) flashDeflBegin(uncompSize, compSize, offset uint32, encrypted boo
 
 	timeout := eraseTimeoutForSize(uncompSize)
 
-	data := make([]byte, 20)
+	// ESP32-S2 and newer ROM bootloaders support a 5th parameter (encrypted
+	// flag). ESP8266 and original ESP32 ROM only accept 4 parameters (16 bytes).
+	paramLen := 16
+	if c.supportsEncryptedFlash || c.isStub {
+		paramLen = 20
+	}
+	data := make([]byte, paramLen)
 	binary.LittleEndian.PutUint32(data[0:4], writeArg)
 	binary.LittleEndian.PutUint32(data[4:8], numBlocks)
 	binary.LittleEndian.PutUint32(data[8:12], writeSize)
 	binary.LittleEndian.PutUint32(data[12:16], offset)
-	if encrypted {
+	if paramLen == 20 && encrypted {
 		binary.LittleEndian.PutUint32(data[16:20], 1)
 	}
 
@@ -459,7 +474,11 @@ func (c *conn) flashMD5(addr, size uint32) ([]byte, error) {
 func (c *conn) changeBaud(newBaud, oldBaud uint32) error {
 	data := make([]byte, 8)
 	binary.LittleEndian.PutUint32(data[0:4], newBaud)
-	binary.LittleEndian.PutUint32(data[4:8], oldBaud)
+	// ROM bootloader ignores the second parameter; stub uses it to know
+	// the current baud rate. Send 0 for ROM to match esptool behavior.
+	if c.isStub {
+		binary.LittleEndian.PutUint32(data[4:8], oldBaud)
+	}
 
 	_, err := c.checkCommand("change baud rate", cmdChangeBaud, data, 0, defaultTimeout, 0)
 	return err

@@ -25,6 +25,8 @@ var defESP32C2 = &chipDef{
 
 	BootloaderFlashOffset: 0x0,
 
+	SupportsEncryptedFlash: true,
+
 	FlashFrequency: map[string]byte{
 		"60m": 0xF,
 		"30m": 0x0,
