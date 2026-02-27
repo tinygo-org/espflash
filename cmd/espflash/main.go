@@ -24,6 +24,9 @@ func main() {
 	chip := flag.String("chip", "auto", "Chip type: auto, esp8266, esp32, esp32s2, esp32s3, esp32c2, esp32c3, esp32c6, esp32h2")
 	noCompress := flag.Bool("no-compress", false, "Disable compression")
 	eraseAll := flag.Bool("erase-all", false, "Erase entire flash before writing")
+	flashMode := flag.String("fm", "keep", "Flash mode: keep, qio, qout, dio, dout")
+	flashFreq := flag.String("ff", "keep", "Flash frequency: keep, 80m, 40m, 26m, 20m (chip-specific)")
+	flashSize := flag.String("fs", "keep", "Flash size: keep, 1MB, 2MB, 4MB, 8MB, 16MB")
 
 	// Multi-image mode
 	bootloader := flag.String("bootloader", "", "Bootloader .bin file (multi-image mode)")
@@ -73,6 +76,9 @@ func main() {
 	opts.Compress = !*noCompress
 	opts.Logger = &espflash.StdoutLogger{W: os.Stdout}
 	opts.ChipType = parseChipType(*chip)
+	opts.FlashMode = *flashMode
+	opts.FlashFreq = *flashFreq
+	opts.FlashSize = *flashSize
 
 	fmt.Printf("Connecting to %s...\n", *port)
 	flasher, err := espflash.NewFlasher(*port, opts)

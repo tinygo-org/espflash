@@ -32,14 +32,17 @@ var defESP8266 = &chipDef{
 		"80m": 0xF,
 	},
 
+	// ESP8266 uses a different flash size encoding than ESP32+.
 	FlashSizes: map[string]byte{
-		"256KB":  0x12,
-		"512KB":  0x13,
-		"1MB":    0x14,
-		"2MB":    0x15,
-		"4MB":    0x16,
-		"2MB-c1": 0x22,
-		"4MB-c1": 0x24,
-		"4MB-c2": 0x26,
+		"256KB":  0x10,
+		"512KB":  0x00,
+		"1MB":    0x20,
+		"2MB":    0x30,
+		"4MB":    0x40,
+		"2MB-c1": 0x50,
+		"4MB-c1": 0x60,
+		"4MB-c2": 0x70,
+		"8MB":    0x80,
+		"16MB":   0x90,
 	},
 }

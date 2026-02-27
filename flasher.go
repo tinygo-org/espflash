@@ -42,9 +42,20 @@ type FlasherOptions struct {
 	// Default: true.
 	Compress bool
 
-	// FlashSize overrides flash size detection.
-	// Valid values: "1MB", "2MB", "4MB", "8MB", "16MB".
-	// Empty string means auto-detect.
+	// FlashMode sets the SPI flash access mode in the image header.
+	// Valid values: "qio", "qout", "dio", "dout".
+	// Empty string or "keep" preserves the value from the binary.
+	// Most ESP32 boards work with "dio"; some need "dout".
+	FlashMode string
+
+	// FlashFreq sets the SPI flash clock frequency in the image header.
+	// Valid values are chip-specific, e.g. "80m", "40m", "26m", "20m".
+	// Empty string or "keep" preserves the value from the binary.
+	FlashFreq string
+
+	// FlashSize sets the flash chip size in the image header.
+	// Valid values: "1MB", "2MB", "4MB", "8MB", "16MB", etc.
+	// Empty string or "keep" preserves the value from the binary.
 	FlashSize string
 
 	// Logger receives informational messages during flashing.
@@ -180,6 +191,7 @@ func (f *Flasher) connect() error {
 		// ResetNoReset: skip reset entirely
 
 		// Try to sync with the bootloader
+		time.Sleep(100 * time.Millisecond) // Give bootloader time to start
 		f.conn.flushInput()
 		for syncAttempt := 0; syncAttempt < 5; syncAttempt++ {
 			_, err := f.conn.sync()
@@ -214,6 +226,9 @@ synced:
 	_ = lastErr // suppress unused warning
 
 	f.logf("Detected chip: %s", f.chip.Name)
+
+	// Propagate chip capabilities to the connection layer.
+	f.conn.supportsEncryptedFlash = f.chip.SupportsEncryptedFlash
 
 	return nil
 }
@@ -277,6 +292,13 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 		return fmt.Errorf("empty image data")
 	}
 
+	// Patch flash parameters in image header (mode, frequency, size)
+	var err error
+	data, err = f.patchImageHeader(data)
+	if err != nil {
+		return fmt.Errorf("patch image header: %w", err)
+	}
+
 	// Pad data to 4-byte alignment
 	if pad := len(data) % 4; pad != 0 {
 		data = append(data, make([]byte, 4-pad)...)
@@ -335,6 +357,14 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 	written := 0
 	for _, img := range images {
 		data := img.Data
+
+		// Patch flash parameters in image header (mode, frequency, size)
+		var err error
+		data, err = f.patchImageHeader(data)
+		if err != nil {
+			return fmt.Errorf("patch image header at 0x%08X: %w", img.Offset, err)
+		}
+
 		// Pad to 4-byte alignment
 		if pad := len(data) % 4; pad != 0 {
 			data = append(data, make([]byte, 4-pad)...)
@@ -350,7 +380,6 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 			}
 		}
 
-		var err error
 		if f.opts.Compress {
 			err = f.flashCompressed(data, img.Offset, partProgress)
 		} else {
