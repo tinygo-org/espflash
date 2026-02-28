@@ -292,6 +292,27 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 		return fmt.Errorf("empty image data")
 	}
 
+	// Auto-detect flash size when not explicitly set.
+	// This matches esptool.py's default --flash_size=detect behavior.
+	// On ESP8266, the ROM bootloader uses the flash size from the image
+	// header to configure SPI flash memory mapping, so it must be correct
+	// for firmware to execute properly.
+	if (f.opts.FlashSize == "" || f.opts.FlashSize == "keep") &&
+		len(data) >= 4 && data[0] == espImageMagic {
+		if detected := f.detectFlashSize(); detected != "" {
+			f.logf("Configuring flash size...")
+			f.logf("Auto-detected flash size: %s", detected)
+			f.opts.FlashSize = detected
+		}
+	}
+
+	// ESP8266 only supports DOUT (and DIO on some boards). Force DOUT
+	// when no explicit flash mode was requested to ensure the image boots.
+	if f.chip != nil && f.chip.ChipType == ChipESP8266 &&
+		(f.opts.FlashMode == "" || f.opts.FlashMode == "keep") {
+		f.opts.FlashMode = "dout"
+	}
+
 	// Patch flash parameters in image header (mode, frequency, size)
 	var err error
 	data, err = f.patchImageHeader(data)
@@ -343,6 +364,22 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 	// Attach SPI flash first
 	if err := f.attachFlash(); err != nil {
 		return fmt.Errorf("attach flash: %w", err)
+	}
+
+	// Auto-detect flash size when not explicitly set.
+	if f.opts.FlashSize == "" || f.opts.FlashSize == "keep" {
+		if detected := f.detectFlashSize(); detected != "" {
+			f.logf("Configuring flash size...")
+			f.logf("Auto-detected flash size: %s", detected)
+			f.opts.FlashSize = detected
+		}
+	}
+
+	// ESP8266 only supports DOUT (and DIO on some boards). Force DOUT
+	// when no explicit flash mode was requested to ensure the image boots.
+	if f.chip != nil && f.chip.ChipType == ChipESP8266 &&
+		(f.opts.FlashMode == "" || f.opts.FlashMode == "keep") {
+		f.opts.FlashMode = "dout"
 	}
 
 	// Optionally switch to higher baud rate (not supported by ESP8266 ROM)
@@ -710,13 +747,20 @@ func (f *Flasher) FlashID() (uint8, uint16, error) {
 		return 0, 0, err
 	}
 
+	// RDID response in W0: byte 0 (LSB) = manufacturer, byte 1 = memory type,
+	// byte 2 = capacity. The ESP SPI peripheral stores the first received
+	// byte in the lowest bits. This matches esptool.py:
+	//   manufacturer = flash_id & 0xFF
+	//   capacity     = (flash_id >> 16) & 0xFF
 	mfgID := uint8(flashID & 0xFF)
-	devID := uint16(((flashID >> 16) & 0xFF) | ((flashID>>8)&0xFF)<<8)
+	devID := uint16(((flashID >> 16) & 0xFF) | ((flashID >> 8) & 0xFF << 8))
 
 	return mfgID, devID, nil
 }
 
 // runSPIFlashCommand executes a SPI flash command at the register level.
+// It configures the SPI peripheral to send 'cmd' as an 8-bit command,
+// optionally write 'data' bytes, and read back 'readBits' bits of response.
 func (f *Flasher) runSPIFlashCommand(cmd byte, data []byte, readBits int) (uint32, error) {
 	if f.chip == nil {
 		return 0, fmt.Errorf("chip not detected")
@@ -724,6 +768,7 @@ func (f *Flasher) runSPIFlashCommand(cmd byte, data []byte, readBits int) (uint3
 
 	base := f.chip.SPIRegBase
 	spiUSRReg := base + f.chip.SPIUSROffs
+	spiUSR1Reg := base + f.chip.SPIUSR1Offs
 	spiUSR2Reg := base + f.chip.SPIUSR2Offs
 	spiW0Reg := base + f.chip.SPIW0Offs
 	spiCMDReg := base // CMD reg is at base
@@ -737,6 +782,7 @@ func (f *Flasher) runSPIFlashCommand(cmd byte, data []byte, readBits int) (uint3
 
 	// Save old SPI register values
 	oldSPIUSR, _ := f.conn.readReg(spiUSRReg)
+	oldSPIUSR1, _ := f.conn.readReg(spiUSR1Reg)
 	oldSPIUSR2, _ := f.conn.readReg(spiUSR2Reg)
 
 	flags := uint32(spiUSRCommand)
@@ -749,7 +795,43 @@ func (f *Flasher) runSPIFlashCommand(cmd byte, data []byte, readBits int) (uint3
 
 	f.conn.writeReg(spiUSRReg, flags, 0xFFFFFFFF, 0)                //nolint:errcheck
 	f.conn.writeReg(spiUSR2Reg, (7<<28)|uint32(cmd), 0xFFFFFFFF, 0) //nolint:errcheck
-	f.conn.writeReg(spiCMDReg, spiCMDUSR, 0xFFFFFFFF, 0)            //nolint:errcheck
+
+	// Configure MISO/MOSI data bit lengths.
+	// ESP32-S2+ use dedicated MISO_DLEN / MOSI_DLEN registers.
+	// ESP8266 and ESP32 encode lengths in the SPI_USR1 register:
+	//   MISO length: bits [7:0] (ESP32) or [4:0] (ESP8266) — value = bitlen-1
+	//   MOSI length: bits [25:17] — value = bitlen-1
+	if f.chip.SPIMISODLenOffs != 0 {
+		// Newer chips: dedicated DLEN registers
+		if readBits > 0 {
+			f.conn.writeReg(base+f.chip.SPIMISODLenOffs, uint32(readBits-1), 0xFFFFFFFF, 0) //nolint:errcheck
+		}
+		if len(data) > 0 {
+			f.conn.writeReg(base+f.chip.SPIMOSIDLenOffs, uint32(len(data)*8-1), 0xFFFFFFFF, 0) //nolint:errcheck
+		}
+	} else {
+		// ESP8266 / ESP32: set lengths via SPI_USR1 fields
+		usr1 := oldSPIUSR1
+		if readBits > 0 {
+			usr1 = (usr1 &^ 0xFF) | uint32(readBits-1) // bits [7:0] = MISO bitlen-1
+		}
+		if len(data) > 0 {
+			usr1 = (usr1 &^ (0x1FF << 17)) | (uint32(len(data)*8-1) << 17) // bits [25:17] = MOSI bitlen-1
+		}
+		f.conn.writeReg(spiUSR1Reg, usr1, 0xFFFFFFFF, 0) //nolint:errcheck
+	}
+
+	// Write MOSI data to W0 register if present
+	if len(data) > 0 {
+		var mosiWord uint32
+		for i, b := range data {
+			mosiWord |= uint32(b) << (8 * uint(i))
+		}
+		f.conn.writeReg(spiW0Reg, mosiWord, 0xFFFFFFFF, 0) //nolint:errcheck
+	}
+
+	// Trigger the SPI user command
+	f.conn.writeReg(spiCMDReg, spiCMDUSR, 0xFFFFFFFF, 0) //nolint:errcheck
 
 	// Wait for SPI command to complete
 	for i := 0; i < 10; i++ {
@@ -764,9 +846,61 @@ func (f *Flasher) runSPIFlashCommand(cmd byte, data []byte, readBits int) (uint3
 
 	// Restore SPI registers
 	f.conn.writeReg(spiUSRReg, oldSPIUSR, 0xFFFFFFFF, 0)   //nolint:errcheck
+	f.conn.writeReg(spiUSR1Reg, oldSPIUSR1, 0xFFFFFFFF, 0) //nolint:errcheck
 	f.conn.writeReg(spiUSR2Reg, oldSPIUSR2, 0xFFFFFFFF, 0) //nolint:errcheck
 
 	return result, nil
+}
+
+// flashSizeFromJEDEC converts a JEDEC flash capacity byte to a standard
+// size string (e.g. "1MB", "4MB"). The JEDEC capacity byte encodes size
+// as 2^N bytes (e.g. 0x14 = 2^20 = 1MB).
+// Returns empty string if the capacity byte is out of range or unrecognized.
+func flashSizeFromJEDEC(capByte uint8) string {
+	if capByte < 18 || capByte > 27 {
+		return "" // outside 256KB..128MB range
+	}
+
+	sizeBytes := uint64(1) << capByte
+
+	switch {
+	case sizeBytes == 256*1024:
+		return "256KB"
+	case sizeBytes == 512*1024:
+		return "512KB"
+	case sizeBytes >= 1024*1024:
+		return fmt.Sprintf("%dMB", sizeBytes/(1024*1024))
+	default:
+		return ""
+	}
+}
+
+// detectFlashSize reads the SPI flash JEDEC ID and determines the flash
+// chip capacity. Returns a size string (e.g. "1MB", "4MB") that matches
+// the chip's FlashSizes map, or empty string if detection fails.
+func (f *Flasher) detectFlashSize() string {
+	if f.chip == nil || f.conn == nil || f.conn.port == nil {
+		return ""
+	}
+
+	_, devID, err := f.FlashID()
+	if err != nil {
+		return ""
+	}
+
+	// The lower byte of devID is the JEDEC capacity byte.
+	capByte := uint8(devID & 0xFF)
+	sizeName := flashSizeFromJEDEC(capByte)
+	if sizeName == "" {
+		return ""
+	}
+
+	// Verify this size is supported by the current chip.
+	if _, ok := f.chip.FlashSizes[sizeName]; ok {
+		return sizeName
+	}
+
+	return ""
 }
 
 // StdoutLogger is a simple Logger implementation that writes to an io.Writer.

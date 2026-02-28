@@ -99,6 +99,13 @@ type chipDef struct {
 	// CHANGE_BAUD command (0x0F). ESP32+ ROMs support this; ESP8266 does not.
 	ROMHasChangeBaud bool
 
+	// SPIMISODLenOffs is the register offset for the MISO data bit length
+	// register (relative to SPIRegBase). On ESP32-S2 and newer, MISO/MOSI
+	// lengths are in dedicated registers. On ESP8266 and ESP32, these are 0
+	// and the lengths are set via fields in the SPI_USR1 register instead.
+	SPIMISODLenOffs uint32
+	SPIMOSIDLenOffs uint32
+
 	// FlashFrequency maps frequency strings to register values.
 	FlashFrequency map[string]byte
 

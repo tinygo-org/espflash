@@ -257,3 +257,26 @@ func TestBootloaderFlashOffset(t *testing.T) {
 		t.Errorf("ESP32 bootloader offset = 0x%X, want 0x1000", defESP32.BootloaderFlashOffset)
 	}
 }
+
+func TestSPIDLenRegisters(t *testing.T) {
+	// ESP8266 and ESP32 use SPI_USR1 for MISO/MOSI bit length (DLEN offsets = 0).
+	for _, def := range []*chipDef{defESP8266, defESP32} {
+		if def.SPIMISODLenOffs != 0 {
+			t.Errorf("%s SPIMISODLenOffs = 0x%X, want 0 (uses USR1)", def.Name, def.SPIMISODLenOffs)
+		}
+		if def.SPIMOSIDLenOffs != 0 {
+			t.Errorf("%s SPIMOSIDLenOffs = 0x%X, want 0 (uses USR1)", def.Name, def.SPIMOSIDLenOffs)
+		}
+	}
+
+	// ESP32-S2 and newer use dedicated MISO_DLEN / MOSI_DLEN registers.
+	newerChips := []*chipDef{defESP32S2, defESP32S3, defESP32C2, defESP32C3, defESP32C6, defESP32H2}
+	for _, def := range newerChips {
+		if def.SPIMISODLenOffs != 0x28 {
+			t.Errorf("%s SPIMISODLenOffs = 0x%X, want 0x28", def.Name, def.SPIMISODLenOffs)
+		}
+		if def.SPIMOSIDLenOffs != 0x24 {
+			t.Errorf("%s SPIMOSIDLenOffs = 0x%X, want 0x24", def.Name, def.SPIMOSIDLenOffs)
+		}
+	}
+}

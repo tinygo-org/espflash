@@ -18,6 +18,9 @@ var defESP32S2 = &chipDef{
 	SPIMISOOffs: 0x98,
 	SPIW0Offs:   0x58,
 
+	SPIMISODLenOffs: 0x28,
+	SPIMOSIDLenOffs: 0x24,
+
 	SPIAddrRegMSB: true,
 
 	UARTDateReg: 0x60000078,

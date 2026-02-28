@@ -39,15 +39,21 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] [firmware.bin]\n\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "Flash ESP32 family devices via serial port.")
+		fmt.Fprintln(os.Stderr, "Flags can appear before or after the firmware file argument.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Single binary mode:")
-		fmt.Fprintf(os.Stderr, "  %s -port /dev/ttyUSB0 firmware.bin\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -port /dev/ttyUSB0 firmware.bin\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -port /dev/ttyUSB0 firmware.bin -fm dout\n\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "Multi-image mode:")
 		fmt.Fprintf(os.Stderr, "  %s -port /dev/ttyUSB0 -bootloader bl.bin -partitions pt.bin -app app.bin\n\n", os.Args[0])
 		fmt.Fprintln(os.Stderr, "Options:")
 		flag.PrintDefaults()
 	}
 
+	// Parse all arguments, allowing flags after positional args.
+	// Go's flag package stops at the first non-flag argument, so we
+	// pre-process os.Args to move the positional .bin file to the end.
+	reorderArgs()
 	flag.Parse()
 
 	if *port == "" {
@@ -203,4 +209,61 @@ func parseChipType(s string) espflash.ChipType {
 		log.Fatalf("Unknown chip type: %s", s)
 		return espflash.ChipAuto
 	}
+}
+
+// reorderArgs moves positional arguments (non-flag args that aren't values of
+// a flag) to the end of os.Args so that Go's flag package can parse all flags
+// regardless of where they appear on the command line. This lets users write:
+//
+//	espflash -port COM3 firmware.bin -fm dout
+//
+// instead of requiring all flags before the positional argument.
+func reorderArgs() {
+	if len(os.Args) <= 1 {
+		return
+	}
+
+	// Collect known flags that take a value argument (not booleans).
+	// We need this to know which args following a flag are its values.
+	valueFlagNames := map[string]bool{}
+	boolFlagNames := map[string]bool{}
+	flag.VisitAll(func(f *flag.Flag) {
+		// Check if the flag's default is a boolean type by looking at the
+		// zero value. Bool flags have IsBoolFlag() method.
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			boolFlagNames[f.Name] = true
+		} else {
+			valueFlagNames[f.Name] = true
+		}
+	})
+
+	args := os.Args[1:]
+	var flagArgs []string
+	var positional []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			// Everything after "--" is positional
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			flagArgs = append(flagArgs, arg)
+			// Check if this flag takes a value
+			name := strings.TrimLeft(arg, "-")
+			// Handle -flag=value syntax
+			if eqIdx := strings.Index(name, "="); eqIdx >= 0 {
+				continue // value is already part of this arg
+			}
+			if valueFlagNames[name] && i+1 < len(args) {
+				i++
+				flagArgs = append(flagArgs, args[i])
+			}
+		} else {
+			positional = append(positional, arg)
+		}
+	}
+
+	os.Args = append([]string{os.Args[0]}, append(flagArgs, positional...)...)
 }

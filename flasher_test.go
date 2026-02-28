@@ -2,6 +2,7 @@ package espflash
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -200,6 +201,7 @@ func TestFlashImagePatchesHeader(t *testing.T) {
 	f := &Flasher{
 		opts: &FlasherOptions{
 			FlashMode: "invalid_mode",
+			FlashSize: "4MB", // set explicitly to skip auto-detection (needs serial port)
 			Compress:  false,
 		},
 		chip: defESP32,
@@ -210,5 +212,75 @@ func TestFlashImagePatchesHeader(t *testing.T) {
 	err := f.FlashImage(data, 0, nil)
 	if err == nil {
 		t.Error("expected error from invalid flash mode during patchImageHeader")
+	}
+}
+
+func TestFlashSizeFromJEDEC(t *testing.T) {
+	tests := []struct {
+		capByte  uint8
+		expected string
+	}{
+		{0x12, "256KB"}, // 2^18 = 256KB
+		{0x13, "512KB"}, // 2^19 = 512KB
+		{0x14, "1MB"},   // 2^20 = 1MB
+		{0x15, "2MB"},   // 2^21 = 2MB
+		{0x16, "4MB"},   // 2^22 = 4MB
+		{0x17, "8MB"},   // 2^23 = 8MB
+		{0x18, "16MB"},  // 2^24 = 16MB
+		{0x19, "32MB"},  // 2^25 = 32MB
+		{0x1A, "64MB"},  // 2^26 = 64MB
+		{0x1B, "128MB"}, // 2^27 = 128MB
+		{0x11, ""},      // 2^17 = 128KB, below minimum
+		{0x1C, ""},      // 2^28 = 256MB, above maximum
+		{0x00, ""},      // out of range
+		{0xFF, ""},      // out of range
+	}
+
+	for _, tt := range tests {
+		name := fmt.Sprintf("0x%02X", tt.capByte)
+		t.Run(name, func(t *testing.T) {
+			got := flashSizeFromJEDEC(tt.capByte)
+			if got != tt.expected {
+				t.Errorf("flashSizeFromJEDEC(0x%02X) = %q, want %q",
+					tt.capByte, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDetectFlashSizeNilChip(t *testing.T) {
+	f := &Flasher{opts: DefaultOptions()}
+	got := f.detectFlashSize()
+	if got != "" {
+		t.Errorf("detectFlashSize() with nil chip = %q, want empty", got)
+	}
+}
+
+func TestFlashSizeFromJEDECMatchesChipSizes(t *testing.T) {
+	// Verify that all JEDEC-detected sizes are present in at least one chip's
+	// FlashSizes map.
+	jedecSizes := map[uint8]string{
+		0x12: "256KB", 0x13: "512KB", 0x14: "1MB", 0x15: "2MB",
+		0x16: "4MB", 0x17: "8MB", 0x18: "16MB",
+	}
+
+	for capByte, sizeName := range jedecSizes {
+		got := flashSizeFromJEDEC(capByte)
+		if got != sizeName {
+			t.Errorf("flashSizeFromJEDEC(0x%02X) = %q, want %q", capByte, got, sizeName)
+		}
+
+		// Check that at least one chip supports this size
+		found := false
+		for _, def := range chipDefs {
+			if _, ok := def.FlashSizes[sizeName]; ok {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no chip supports JEDEC-detected size %q (capByte=0x%02X)",
+				sizeName, capByte)
+		}
 	}
 }
