@@ -122,12 +122,24 @@ func NewFlasher(portName string, opts *FlasherOptions) (*Flasher, error) {
 		Parity:   serial.NoParity,
 		DataBits: 8,
 		StopBits: serial.OneStopBit,
+		// Explicitly start with DTR and RTS deasserted.
+		// On Windows, the default (nil) asserts both DTR and RTS on port open,
+		// which immediately drives GPIO0=LOW and EN=LOW on USB-UART bridges,
+		// or confuses the USB-JTAG peripheral's internal state machine.
+		// On Linux, nil leaves them untouched (typically deasserted).
+		// Setting both to false ensures a consistent starting state on all OSes.
+		InitialStatusBits: &serial.ModemOutputBits{DTR: false, RTS: false},
 	}
 
 	port, err := serial.Open(portName, mode)
 	if err != nil {
 		return nil, fmt.Errorf("open serial port %s: %w", portName, err)
 	}
+
+	// Allow the port and any USB driver to settle after opening.
+	// On Windows, CDC-ACM drivers (used by USB-JTAG/Serial) need time to
+	// process the initial signal state before reset sequences begin.
+	time.Sleep(50 * time.Millisecond)
 
 	f := &Flasher{
 		port:    port,
@@ -181,21 +193,23 @@ func (f *Flasher) connect() error {
 
 	for attempt := 0; attempt < attempts; attempt++ {
 		// Reset the chip into bootloader mode.
-		// In default mode, rotate through three strategies:
-		//   - Classic DTR/RTS reset (for external USB-UART bridges)
-		//   - Tight-timing variant (for some Linux serial drivers)
-		//   - USB-JTAG/Serial reset (for built-in USB-JTAG peripherals
-		//     on ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2)
-		// This ensures both external UART and USB-JTAG connections are tried.
+		// In default mode, alternate between classic DTR/RTS reset
+		// (for external USB-UART bridges) and USB-JTAG/Serial reset
+		// (for built-in USB-JTAG peripherals on ESP32-S3, ESP32-C3,
+		// ESP32-C6, ESP32-H2). Tight-timing variant is mixed in for
+		// some Linux serial drivers.
 		if f.opts.ResetMode == ResetDefault {
-			switch attempt % 3 {
+			switch attempt % 4 {
 			case 0:
 				classicReset(f.port, defaultResetDelay)
 				usedUSBJTAGReset = false
 			case 1:
+				usbJTAGSerialReset(f.port)
+				usedUSBJTAGReset = true
+			case 2:
 				tightReset(f.port, defaultResetDelay+500*time.Millisecond)
 				usedUSBJTAGReset = false
-			case 2:
+			case 3:
 				usbJTAGSerialReset(f.port)
 				usedUSBJTAGReset = true
 			}
@@ -237,6 +251,14 @@ synced:
 			return fmt.Errorf("unsupported chip type: %s", f.opts.ChipType)
 		}
 		f.chip = def
+	}
+
+	// If the chip has a USB-JTAG peripheral, assume USB-JTAG connection
+	// for hard reset purposes. This handles the case where classic reset
+	// happened to sync (some boards expose both UART and USB-JTAG), but
+	// the USB-JTAG hard reset sequence is still needed for proper reset.
+	if f.chip != nil && f.chip.HasUSBJTAG {
+		f.usesUSBJTAG = true
 	}
 
 	_ = lastErr // suppress unused warning
@@ -666,14 +688,6 @@ func (f *Flasher) Reset() {
 	time.Sleep(50 * time.Millisecond)
 
 	hardReset(f.port, f.usesUSBJTAG)
-
-	// Ensure clean signal state before the port is closed.
-	// On Windows, DTR/RTS may remain latched after port close, which
-	// can prevent the chip from booting normally or from being reset
-	// into bootloader mode on the next flash attempt.
-	f.port.SetDTR(false) //nolint:errcheck
-	f.port.SetRTS(false) //nolint:errcheck
-
 	f.logf("Device reset.")
 }
 
