@@ -1,7 +1,7 @@
 # espflash
 
-A Go library for flashing firmware to Espressif ESP8266 and ESP32-family microcontrollers over a serial (UART) connection.
- 
+A Go command-line tool and library for flashing firmware to Espressif ESP8266 and ESP32-family microcontrollers over a serial (UART) connection.
+
 ## Supported Chips
 
 - ESP8266
@@ -13,13 +13,45 @@ A Go library for flashing firmware to Espressif ESP8266 and ESP32-family microco
 - ESP32-C6
 - ESP32-H2
 
-## Installation
+## CLI Tool
+
+### Installation
 
 ```bash
-go get tinygo.org/x/espflash
+go install tinygo.org/x/espflash@latest
 ```
 
-## Quick Start
+### CLI Usage
+
+```bash
+# Install
+go install tinygo.org/x/espflash@latest
+
+# Flash a single binary
+espflash -port /dev/ttyUSB0 firmware.bin
+
+# Flash with specific offset and chip
+espflash -port /dev/ttyUSB0 -offset 0x10000 -chip esp32s3 app.bin
+
+# Flash multiple images (bootloader + partitions + app)
+espflash -port /dev/ttyUSB0 \
+    -bootloader bootloader.bin \
+    -partitions partitions.bin \
+    -app application.bin
+
+# Erase flash before writing
+espflash -port /dev/ttyUSB0 -erase-all firmware.bin
+```
+
+## Library
+
+### Installation
+
+```bash
+go get tinygo.org/x/espflash/pkg/espflash
+```
+
+### Quick Start
 
 ```go
 package main
@@ -29,7 +61,7 @@ import (
     "log"
     "os"
 
-    "tinygo.org/x/espflash"
+    "tinygo.org/x/espflash/pkg/espflash"
 )
 
 func main() {
@@ -123,41 +155,18 @@ val, err := flasher.ReadRegister(0x3FF00050)
 flasher.Reset()
 ```
 
-## Example CLI
-
-An example command-line tool is included in `cmd/espflash/`:
-
-```bash
-# Build the CLI
-go build -o espflash ./cmd/espflash
-
-# Flash a single binary
-./espflash -port /dev/ttyUSB0 firmware.bin
-
-# Flash with specific offset and chip
-./espflash -port /dev/ttyUSB0 -offset 0x10000 -chip esp32s3 app.bin
-
-# Flash multiple images (bootloader + partitions + app)
-./espflash -port /dev/ttyUSB0 \
-    -bootloader bootloader.bin \
-    -partitions partitions.bin \
-    -app application.bin
-
-# Erase flash before writing
-./espflash -port /dev/ttyUSB0 -erase-all firmware.bin
-```
-
 ## Architecture
 
 The library is organized in layers:
 
 | Layer | File(s) | Description |
 |-------|---------|-------------|
-| SLIP | `slip.go` | Serial Line Internet Protocol framing |
-| Protocol | `protocol.go` | ROM bootloader command/response protocol |
-| Chip | `chip.go`, `target_*.go` | Per-target definitions and detection |
-| Reset | `reset.go` | Hardware reset strategies |
-| Flasher | `flasher.go` | High-level flash/verify/reset API |
+| SLIP | `pkg/espflash/slip.go` | Serial Line Internet Protocol framing |
+| Protocol | `pkg/espflash/protocol.go` | ROM bootloader command/response protocol |
+| Chip | `pkg/espflash/chip.go`, `pkg/espflash/target_*.go` | Per-target definitions and detection |
+| Reset | `pkg/espflash/reset.go` | Hardware reset strategies |
+| Flasher | `pkg/espflash/flasher.go` | High-level flash/verify/reset API |
+| CLI | `main.go` | Command-line interface |
 
 ## Protocol Reference
 

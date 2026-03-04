@@ -1,4 +1,9 @@
-// Command espflash is an example CLI tool demonstrating the espflash library.
+// Command espflash flashes firmware to Espressif ESP8266 and ESP32-family
+// microcontrollers over a serial (UART) connection.
+//
+// Install:
+//
+//	go install tinygo.org/x/espflash@latest
 //
 // Usage:
 //
@@ -14,7 +19,7 @@ import (
 	"strconv"
 	"strings"
 
-	"tinygo.org/x/espflash"
+	"tinygo.org/x/espflash/pkg/espflash"
 )
 
 func main() {
