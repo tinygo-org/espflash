@@ -1,5 +1,7 @@
 # espflash
 
+[![Test](https://github.com/tinygo-org/espflash/actions/workflows/test.yml/badge.svg)](https://github.com/tinygo-org/espflash/actions/workflows/test.yml)
+
 A Go command-line tool and library for flashing firmware to Espressif ESP8266 and ESP32-family microcontrollers over a serial (UART) connection.
 
 ## Supported Chips
