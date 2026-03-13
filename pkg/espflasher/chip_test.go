@@ -56,10 +56,10 @@ func TestChipDefsCompleteness(t *testing.T) {
 		if def.Name == "" {
 			t.Errorf("chipDefs[%s].Name is empty", ct)
 		}
-		if def.FlashSizes == nil || len(def.FlashSizes) == 0 {
+		if len(def.FlashSizes) == 0 {
 			t.Errorf("chipDefs[%s].FlashSizes is empty", ct)
 		}
-		if def.FlashFrequency == nil || len(def.FlashFrequency) == 0 {
+		if len(def.FlashFrequency) == 0 {
 			t.Errorf("chipDefs[%s].FlashFrequency is empty", ct)
 		}
 	}

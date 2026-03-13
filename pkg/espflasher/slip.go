@@ -92,10 +92,7 @@ func (r *slipReader) ReadFrame(timeout time.Duration) ([]byte, error) {
 			break
 		}
 
-		readTimeout := remaining
-		if readTimeout > 100*time.Millisecond {
-			readTimeout = 100 * time.Millisecond
-		}
+		readTimeout := min(remaining, 100*time.Millisecond)
 		r.port.SetReadTimeout(readTimeout)
 
 		n, err := r.port.Read(buf)
@@ -109,7 +106,7 @@ func (r *slipReader) ReadFrame(timeout time.Duration) ([]byte, error) {
 			continue
 		}
 
-		for i := 0; i < n; i++ {
+		for i := range n {
 			b := buf[i]
 
 			if !inFrame {
