@@ -73,6 +73,9 @@ type chipDef struct {
 	SPIMISOOffs uint32
 	SPIW0Offs   uint32
 
+	// SecureDownloadMode is true if esptool detects the ROM is in Secure Download Mode
+	SecureDownloadMode bool
+
 	// SPIAddrRegMSB: if true, SPI peripheral sends from MSB of 32-bit register.
 	SPIAddrRegMSB bool
 
@@ -129,45 +132,8 @@ var chipDefs = map[ChipType]*chipDef{
 	ChipESP32H2: defESP32H2,
 }
 
-// detectChip reads the chip magic register or chip ID to identify the
-// connected ESP device.
-func detectChip(c *conn) (*chipDef, error) {
-	// First try reading the magic register (works for all chips)
-	magic, err := c.readReg(chipDetectMagicRegAddr)
-	if err != nil {
-		return nil, fmt.Errorf("read chip detect register: %w", err)
-	}
-
-	// Check magic value against known chips
-	for _, def := range chipDefs {
-		if def.UsesMagicValue && def.MagicValue == magic {
-			return def, nil
-		}
-	}
-
-	// For newer chips (ESP32-S3, ESP32-C3, etc.), the magic register value
-	// may not match. These chips use chip ID from the security info instead.
-	// However, reading chip ID requires the GET_SECURITY_INFO command which
-	// may not work before we know the chip type.
-	//
-	// As a fallback, we can also detect by the UART date register value,
-	// or by trying known magic values for newer chips.
-	// Newer chips have different magic values at this register.
-
-	// Try matching by non-magic-value chips
-	for _, def := range chipDefs {
-		if !def.UsesMagicValue {
-			// For these chips, try to read a chip-specific register to verify
-			// We can't easily do chip_id check without knowing the chip first,
-			// so try to match by reading registers at known addresses.
-			continue
-		}
-	}
-
-	return nil, &ChipDetectError{MagicValue: magic}
-}
-
-// detectChipByMagic returns the chip definition matching the given magic value.
+// detectChipByMagic returns the chip definition matching the given magic value,
+// or nil if no match is found.
 func detectChipByMagic(magic uint32) *chipDef {
 	for _, def := range chipDefs {
 		if def.UsesMagicValue && def.MagicValue == magic {

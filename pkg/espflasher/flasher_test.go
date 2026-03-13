@@ -2,6 +2,8 @@ package espflasher
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"testing"
 )
@@ -253,6 +255,131 @@ func TestDetectFlashSizeNilChip(t *testing.T) {
 	got := f.detectFlashSize()
 	if got != "" {
 		t.Errorf("detectFlashSize() with nil chip = %q, want empty", got)
+	}
+}
+
+func TestDetectChipOlderChipsByMagic(t *testing.T) {
+	tests := []struct {
+		name     string
+		magic    uint32
+		wantChip ChipType
+	}{
+		{"ESP8266", 0xFFF0C101, ChipESP8266},
+		{"ESP32", 0x00F01D83, ChipESP32},
+		{"ESP32-S2", 0x000007C6, ChipESP32S2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Return a 12-byte security info response (short format, no ChipID)
+			// so the chip ID loop doesn't match and falls through to magic detection.
+			secInfo := make([]byte, 12)
+
+			mc := &mockConnection{
+				securityInfoFunc: func() ([]byte, error) {
+					return secInfo, nil
+				},
+				readRegFunc: func(addr uint32) (uint32, error) {
+					return tt.magic, nil
+				},
+			}
+			f := &Flasher{
+				conn: mc,
+			}
+
+			def, err := f.detectChip()
+			if err != nil {
+				t.Fatalf("detectChip() error: %v", err)
+			}
+			if def.ChipType != tt.wantChip {
+				t.Errorf("detectChip() = %v, want %v", def.ChipType, tt.wantChip)
+			}
+		})
+	}
+}
+
+// makeSecurityInfo20 builds a 20-byte security info response (long format)
+// with the given chipID encoded at byte offset 12 (little-endian).
+// Layout: Flags(4) + B1-B8(8) + ChipID(4) + APIVersion(4).
+func makeSecurityInfo20(chipID uint32) []byte {
+	buf := make([]byte, 20)
+	binary.LittleEndian.PutUint32(buf[12:16], chipID)
+	return buf
+}
+
+func TestDetectChipNewerChips(t *testing.T) {
+	tests := map[string]struct {
+		secInfo  []byte
+		expected ChipType
+	}{
+		"ESP32-S3": {
+			secInfo:  makeSecurityInfo20(9),
+			expected: ChipESP32S3,
+		},
+		"ESP32-C2": {
+			secInfo:  makeSecurityInfo20(12),
+			expected: ChipESP32C2,
+		},
+		"ESP32-C3": {
+			secInfo:  makeSecurityInfo20(5),
+			expected: ChipESP32C3,
+		},
+		"ESP32-C6": {
+			secInfo:  makeSecurityInfo20(13),
+			expected: ChipESP32C6,
+		},
+		"ESP32-H2": {
+			secInfo:  makeSecurityInfo20(16),
+			expected: ChipESP32H2,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			mc := &mockConnection{
+				securityInfoFunc: func() ([]byte, error) {
+					return tt.secInfo, nil
+				},
+			}
+			f := &Flasher{
+				conn: mc,
+			}
+
+			def, err := f.detectChip()
+			if err != nil {
+				t.Fatalf("detectChip() error: %v", err)
+			}
+			if def.ChipType != tt.expected {
+				t.Errorf("detectChip() = %v, want %v", def.ChipType, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDetectChipReadRegError(t *testing.T) {
+	// When securityInfo returns no ChipID and readReg fails,
+	// detectChip falls back to ESP32-S2.
+	secInfo := make([]byte, 12)
+
+	mc := &mockConnection{
+		securityInfoFunc: func() ([]byte, error) {
+			return secInfo, nil
+		},
+		readRegFunc: func(addr uint32) (uint32, error) {
+			return 0, errors.New("serial port disconnected")
+		},
+	}
+	f := &Flasher{
+		opts: DefaultOptions(),
+		conn: mc,
+	}
+
+	def, err := f.detectChip()
+	if err != nil {
+		t.Fatalf("detectChip() should not error when readReg fails (falls back to ESP32-S2), got: %v", err)
+	}
+	if def.ChipType != ChipESP32S2 {
+		t.Errorf("detectChip() = %v, want ChipESP32S2 (fallback)", def.ChipType)
 	}
 }
 
