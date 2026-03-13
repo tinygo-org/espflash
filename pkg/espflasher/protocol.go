@@ -11,22 +11,23 @@ import (
 // ROM bootloader command opcodes.
 // These are shared across all ESP chip families.
 const (
-	cmdFlashBegin    byte = 0x02 // Start flash download
-	cmdFlashData     byte = 0x03 // Flash data block
-	cmdFlashEnd      byte = 0x04 // Finish flash download
-	cmdMemBegin      byte = 0x05 // Start RAM download
-	cmdMemEnd        byte = 0x06 // Finish RAM download / execute
-	cmdMemData       byte = 0x07 // RAM data block
-	cmdSync          byte = 0x08 // Sync with bootloader
-	cmdWriteReg      byte = 0x09 // Write 32-bit memory-mapped register
-	cmdReadReg       byte = 0x0A // Read 32-bit memory-mapped register
-	cmdSPISetParams  byte = 0x0B // Configure SPI flash parameters
-	cmdSPIAttach     byte = 0x0D // Attach SPI flash
-	cmdChangeBaud    byte = 0x0F // Change UART baud rate
-	cmdFlashDeflBeg  byte = 0x10 // Start compressed flash download
-	cmdFlashDeflData byte = 0x11 // Compressed flash data block
-	cmdFlashDeflEnd  byte = 0x12 // Finish compressed flash download
-	cmdSPIFlashMD5   byte = 0x13 // Calculate MD5 of flash region
+	cmdFlashBegin      byte = 0x02 // Start flash download
+	cmdFlashData       byte = 0x03 // Flash data block
+	cmdFlashEnd        byte = 0x04 // Finish flash download
+	cmdMemBegin        byte = 0x05 // Start RAM download
+	cmdMemEnd          byte = 0x06 // Finish RAM download / execute
+	cmdMemData         byte = 0x07 // RAM data block
+	cmdSync            byte = 0x08 // Sync with bootloader
+	cmdWriteReg        byte = 0x09 // Write 32-bit memory-mapped register
+	cmdReadReg         byte = 0x0A // Read 32-bit memory-mapped register
+	cmdSecurityInfoReg byte = 0x14 // Read security info (chip ID, flash encryption, etc.)
+	cmdSPISetParams    byte = 0x0B // Configure SPI flash parameters
+	cmdSPIAttach       byte = 0x0D // Attach SPI flash
+	cmdChangeBaud      byte = 0x0F // Change UART baud rate
+	cmdFlashDeflBeg    byte = 0x10 // Start compressed flash download
+	cmdFlashDeflData   byte = 0x11 // Compressed flash data block
+	cmdFlashDeflEnd    byte = 0x12 // Finish compressed flash download
+	cmdSPIFlashMD5     byte = 0x13 // Calculate MD5 of flash region
 
 	// Stub-only commands (available after stub loader is running)
 	cmdEraseFlash  byte = 0xD0 // Erase entire flash
@@ -76,11 +77,21 @@ const (
 type conn struct {
 	port   serial.Port
 	reader *slipReader
-	isStub bool
+	stub   bool
 	// supportsEncryptedFlash indicates the ROM supports the 5th parameter
 	// (encrypted flag) in flash_begin/flash_defl_begin commands.
 	// Set based on chip type after detection.
 	supportsEncryptedFlash bool
+}
+
+// isStub returns whether the stub loader is running.
+func (c *conn) isStub() bool {
+	return c.stub
+}
+
+// setSupportsEncryptedFlash sets whether the ROM supports encrypted flash commands.
+func (c *conn) setSupportsEncryptedFlash(v bool) {
+	c.supportsEncryptedFlash = v
 }
 
 // newConn creates a new protocol connection over the given serial port.
@@ -136,7 +147,7 @@ func (c *conn) command(opcode byte, data []byte, chk uint32, timeout time.Durati
 	}
 
 	// Try to get a matching response (filter for correct opcode)
-	for retry := 0; retry < 100; retry++ {
+	for range 100 {
 		frame, err := c.reader.ReadFrame(timeout)
 		if err != nil {
 			return nil, err
@@ -236,7 +247,7 @@ func (c *conn) sync() (uint32, error) {
 	}
 
 	// Read remaining sync responses (ROM sends up to 7 more)
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		c.command(0, nil, 0, syncTimeout, true) //nolint:errcheck
 	}
 
@@ -266,6 +277,27 @@ func (c *conn) writeReg(addr, value, mask, delayUS uint32) error {
 
 	_, err := c.checkCommand("write register", cmdWriteReg, data, 0, defaultTimeout, 0)
 	return err
+}
+
+// securityInfo reads security-related information from the device.
+// Try with 20 bytes first (most chips), fallback to 12 bytes (ESP32-S2).
+func (c *conn) securityInfo() ([]byte, error) {
+	data := make([]byte, 20)
+
+	result, err := c.checkCommand("get security info", cmdSecurityInfoReg, data, 0, defaultTimeout, 20)
+	if err == nil {
+		// early return if successful with 20-byte response
+		return result, nil
+	}
+
+	// fallback to 12-byte response for older ROMs (ESP32-S2)
+	data = make([]byte, 12)
+	result, err = c.checkCommand("get security info", cmdSecurityInfoReg, data, 0, defaultTimeout, 12)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // memBegin starts a RAM download operation.
@@ -316,7 +348,7 @@ func (c *conn) flashBegin(size, offset uint32, encrypted bool) error {
 	numBlocks := (size + writeSize - 1) / writeSize
 
 	eraseSize := size
-	if !c.isStub {
+	if !c.stub {
 		eraseSize = (numBlocks * writeSize)
 	}
 
@@ -326,7 +358,7 @@ func (c *conn) flashBegin(size, offset uint32, encrypted bool) error {
 	// flag). ESP8266 and original ESP32 ROM only accept 4 parameters (16 bytes).
 	// Sending 20 bytes to those older ROMs causes error 0x05 (invalid message).
 	paramLen := 16
-	if c.supportsEncryptedFlash || c.isStub {
+	if c.supportsEncryptedFlash || c.stub {
 		paramLen = 20
 	}
 	data := make([]byte, paramLen)
@@ -372,7 +404,7 @@ func (c *conn) flashDeflBegin(uncompSize, compSize, offset uint32, encrypted boo
 	numBlocks := (compSize + writeSize - 1) / writeSize
 
 	var writeArg uint32
-	if c.isStub {
+	if c.stub {
 		writeArg = uncompSize // stub handles erase internally
 	} else {
 		eraseBlocks := (uncompSize + writeSize - 1) / writeSize
@@ -384,7 +416,7 @@ func (c *conn) flashDeflBegin(uncompSize, compSize, offset uint32, encrypted boo
 	// ESP32-S2 and newer ROM bootloaders support a 5th parameter (encrypted
 	// flag). ESP8266 and original ESP32 ROM only accept 4 parameters (16 bytes).
 	paramLen := 16
-	if c.supportsEncryptedFlash || c.isStub {
+	if c.supportsEncryptedFlash || c.stub {
 		paramLen = 20
 	}
 	data := make([]byte, paramLen)
@@ -476,7 +508,7 @@ func (c *conn) changeBaud(newBaud, oldBaud uint32) error {
 	binary.LittleEndian.PutUint32(data[0:4], newBaud)
 	// ROM bootloader ignores the second parameter; stub uses it to know
 	// the current baud rate. Send 0 for ROM to match esptool behavior.
-	if c.isStub {
+	if c.stub {
 		binary.LittleEndian.PutUint32(data[4:8], oldBaud)
 	}
 
@@ -503,7 +535,7 @@ func (c *conn) eraseRegion(offset, size uint32) error {
 
 // flashWriteSize returns the appropriate block size based on loader type.
 func (c *conn) flashWriteSize() uint32 {
-	if c.isStub {
+	if c.stub {
 		return flashWriteSizeStub
 	}
 	return flashWriteSizeROM

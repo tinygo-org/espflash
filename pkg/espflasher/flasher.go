@@ -85,14 +85,38 @@ func DefaultOptions() *FlasherOptions {
 	}
 }
 
+// connection defines the low-level protocol operations for communicating
+// with an ESP bootloader over a serial connection.
+type connection interface {
+	sync() (uint32, error)
+	readReg(addr uint32) (uint32, error)
+	writeReg(addr, value, mask, delayUS uint32) error
+	securityInfo() ([]byte, error)
+	flashBegin(size, offset uint32, encrypted bool) error
+	flashData(block []byte, seq uint32) error
+	flashEnd(reboot bool) error
+	flashDeflBegin(uncompSize, compSize, offset uint32, encrypted bool) error
+	flashDeflData(block []byte, seq uint32) error
+	flashDeflEnd(reboot bool) error
+	flashMD5(addr, size uint32) ([]byte, error)
+	flashWriteSize() uint32
+	spiAttach(value uint32) error
+	spiSetParams(totalSize, blockSize, sectorSize, pageSize uint32) error
+	changeBaud(newBaud, oldBaud uint32) error
+	eraseFlash() error
+	eraseRegion(offset, size uint32) error
+	flushInput()
+	isStub() bool
+	setSupportsEncryptedFlash(v bool)
+}
+
 // Flasher manages the connection to an ESP device and provides
 // high-level flash operations.
 type Flasher struct {
 	port    serial.Port
-	conn    *conn
+	conn    connection
 	chip    *chipDef
 	opts    *FlasherOptions
-	isStub  bool
 	portStr string
 }
 
@@ -175,8 +199,6 @@ func (f *Flasher) connect() error {
 		attempts = 7
 	}
 
-	var lastErr error
-
 	for attempt := 0; attempt < attempts; attempt++ {
 		// Reset the chip into bootloader mode
 		switch f.opts.ResetMode {
@@ -194,12 +216,11 @@ func (f *Flasher) connect() error {
 		// Try to sync with the bootloader
 		time.Sleep(100 * time.Millisecond) // Give bootloader time to start
 		f.conn.flushInput()
-		for syncAttempt := 0; syncAttempt < 5; syncAttempt++ {
+		for range 5 {
 			_, err := f.conn.sync()
 			if err == nil {
 				goto synced
 			}
-			lastErr = err
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
@@ -224,50 +245,46 @@ synced:
 		f.chip = def
 	}
 
-	_ = lastErr // suppress unused warning
-
 	f.logf("Detected chip: %s", f.chip.Name)
 
 	// Propagate chip capabilities to the connection layer.
-	f.conn.supportsEncryptedFlash = f.chip.SupportsEncryptedFlash
+	f.conn.setSupportsEncryptedFlash(f.chip.SupportsEncryptedFlash)
 
 	return nil
 }
 
 // detectChip identifies the connected ESP chip.
 func (f *Flasher) detectChip() (*chipDef, error) {
-	// Try reading the magic register first
+	si, err := f.readSecurityInfo()
+	if err != nil {
+		f.logf("unable to read security info: %s", err)
+	}
+
+	for _, def := range chipDefs {
+		if def.UsesMagicValue {
+			continue
+		}
+
+		if si != nil && si.ChipID != nil && *si.ChipID == uint32(def.ImageChipID) {
+			def.SecureDownloadMode = si.ParsedFlags.SecureDownloadEnable
+			return def, nil
+		}
+	}
+
+	// Otherwise, try to read the chip magic value to verify the chip type (ESP8266, ESP32, ESP32-S2)
 	magic, err := f.conn.readReg(chipDetectMagicRegAddr)
 	if err != nil {
-		return nil, fmt.Errorf("detect chip: %w", err)
+		// Only ESP32-S2 does not support chip id detection
+		// and supports secure download mode
+		f.logf("unable to read chip magic value. Defaulting to ESP32-S2: %s", err)
+
+		chipDefs[ChipESP32S2].SecureDownloadMode = si.ParsedFlags.SecureDownloadEnable
+		return chipDefs[ChipESP32S2], nil
 	}
 
 	// Check magic value for older chips (ESP8266, ESP32, ESP32-S2)
 	if def := detectChipByMagic(magic); def != nil {
 		return def, nil
-	}
-
-	// For newer chips, try to match the magic value against known values
-	// These chips have different magic values at the detect register
-	// Source: esptool chip detection logic
-	type magicEntry struct {
-		magic uint32
-		def   *chipDef
-	}
-
-	// Known magic values for newer chips (from esptool source)
-	newChipMagics := []magicEntry{
-		{0x6F51306F, defESP32C2}, // ESP32-C2
-		{0x1B31506F, defESP32C3}, // ESP32-C3
-		{0x0DA1806F, defESP32C6}, // ESP32-C6
-		{0xD7B73E80, defESP32H2}, // ESP32-H2
-		{0x09, defESP32S3},       // ESP32-S3 returns chip_id
-	}
-
-	for _, entry := range newChipMagics {
-		if magic == entry.magic {
-			return entry.def, nil
-		}
 	}
 
 	return nil, &ChipDetectError{MagicValue: magic}
@@ -332,7 +349,7 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 	}
 
 	// Optionally switch to higher baud rate (not supported by ESP8266 ROM)
-	canChangeBaud := f.chip == nil || f.chip.ROMHasChangeBaud || f.conn.isStub
+	canChangeBaud := f.chip == nil || f.chip.ROMHasChangeBaud || f.conn.isStub()
 	if canChangeBaud && f.opts.FlashBaudRate > 0 && f.opts.FlashBaudRate != f.opts.BaudRate {
 		if err := f.changeBaud(f.opts.FlashBaudRate); err != nil {
 			f.logf("Warning: could not change baud rate to %d: %v", f.opts.FlashBaudRate, err)
@@ -341,7 +358,7 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 	}
 
 	// Use compressed flash only if supported (ESP8266 ROM doesn't support it)
-	canCompress := f.chip == nil || f.chip.ROMHasCompressedFlash || f.conn.isStub
+	canCompress := f.chip == nil || f.chip.ROMHasCompressedFlash || f.conn.isStub()
 	if f.opts.Compress && canCompress {
 		return f.flashCompressed(data, offset, progress)
 	}
@@ -384,7 +401,7 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 	}
 
 	// Optionally switch to higher baud rate (not supported by ESP8266 ROM)
-	canChangeBaud := f.chip == nil || f.chip.ROMHasChangeBaud || f.conn.isStub
+	canChangeBaud := f.chip == nil || f.chip.ROMHasChangeBaud || f.conn.isStub()
 	if canChangeBaud && f.opts.FlashBaudRate > 0 && f.opts.FlashBaudRate != f.opts.BaudRate {
 		if err := f.changeBaud(f.opts.FlashBaudRate); err != nil {
 			f.logf("Warning: could not change baud rate to %d: %v", f.opts.FlashBaudRate, err)
@@ -392,7 +409,7 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 	}
 
 	// Determine if compressed flash is available
-	canCompress := f.chip == nil || f.chip.ROMHasCompressedFlash || f.conn.isStub
+	canCompress := f.chip == nil || f.chip.ROMHasCompressedFlash || f.conn.isStub()
 
 	totalSize := 0
 	for _, img := range images {
@@ -481,14 +498,11 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 	seq := uint32(0)
 
 	for sent < compSize {
-		blockLen := compSize - sent
-		if blockLen > writeSize {
-			blockLen = writeSize
-		}
+		blockLen := min(compSize-sent, writeSize)
 
 		block := compressed[sent : sent+blockLen]
 		if err := f.conn.flashDeflData(block, seq); err != nil {
-			return fmt.Errorf("flash block %d: %w", seq, err)
+			return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
 		}
 
 		sent += blockLen
@@ -496,10 +510,7 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 
 		if progress != nil {
 			// Map compressed bytes sent to approximate uncompressed progress
-			approxUncomp := int(float64(sent) / float64(compSize) * float64(uncompSize))
-			if approxUncomp > int(uncompSize) {
-				approxUncomp = int(uncompSize)
-			}
+			approxUncomp := min(int(float64(sent)/float64(compSize)*float64(uncompSize)), int(uncompSize))
 			progress(approxUncomp, int(uncompSize))
 		}
 	}
@@ -512,7 +523,7 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 	f.logf("Flash complete. Verifying...")
 
 	// Verify via MD5 if stub is running
-	if f.conn.isStub {
+	if f.conn.isStub() {
 		if err := f.verifyMD5(data, offset); err != nil {
 			return err
 		}
@@ -555,7 +566,7 @@ func (f *Flasher) flashUncompressed(data []byte, offset uint32, progress Progres
 		}
 
 		if err := f.conn.flashData(block, seq); err != nil {
-			return fmt.Errorf("flash block %d: %w", seq, err)
+			return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
 		}
 
 		sent += blockLen
@@ -574,7 +585,7 @@ func (f *Flasher) flashUncompressed(data []byte, offset uint32, progress Progres
 	f.logf("Flash complete. Verifying...")
 
 	// Verify via MD5 if stub is running
-	if f.conn.isStub {
+	if f.conn.isStub() {
 		if err := f.verifyMD5(data, offset); err != nil {
 			return err
 		}
@@ -607,7 +618,7 @@ func (f *Flasher) verifyMD5(data []byte, offset uint32) error {
 // This operation can take a significant amount of time (30-120 seconds).
 // Requires the stub loader to be running.
 func (f *Flasher) EraseFlash() error {
-	if !f.conn.isStub {
+	if !f.conn.isStub() {
 		return &UnsupportedCommandError{Command: "erase flash (requires stub)"}
 	}
 
@@ -880,7 +891,7 @@ func flashSizeFromJEDEC(capByte uint8) string {
 // chip capacity. Returns a size string (e.g. "1MB", "4MB") that matches
 // the chip's FlashSizes map, or empty string if detection fails.
 func (f *Flasher) detectFlashSize() string {
-	if f.chip == nil || f.conn == nil || f.conn.port == nil {
+	if f.chip == nil || f.conn == nil {
 		return ""
 	}
 

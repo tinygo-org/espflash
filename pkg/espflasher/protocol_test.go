@@ -52,12 +52,12 @@ func TestChecksum(t *testing.T) {
 }
 
 func TestFlashWriteSize(t *testing.T) {
-	romConn := &conn{isStub: false}
+	romConn := &conn{stub: false}
 	if romConn.flashWriteSize() != flashWriteSizeROM {
 		t.Errorf("ROM write size = %d, want %d", romConn.flashWriteSize(), flashWriteSizeROM)
 	}
 
-	stubConn := &conn{isStub: true}
+	stubConn := &conn{stub: true}
 	if stubConn.flashWriteSize() != flashWriteSizeStub {
 		t.Errorf("Stub write size = %d, want %d", stubConn.flashWriteSize(), flashWriteSizeStub)
 	}
@@ -197,7 +197,7 @@ func TestFlashBeginParamLength(t *testing.T) {
 			c := &conn{
 				port:                   mock,
 				reader:                 newSlipReader(mock),
-				isStub:                 tt.isStub,
+				stub:                   tt.isStub,
 				supportsEncryptedFlash: tt.supportsEncr,
 			}
 
@@ -249,7 +249,7 @@ func TestFlashDeflBeginParamLength(t *testing.T) {
 			c := &conn{
 				port:                   mock,
 				reader:                 newSlipReader(mock),
-				isStub:                 tt.isStub,
+				stub:                   tt.isStub,
 				supportsEncryptedFlash: tt.supportsEncr,
 			}
 
@@ -301,7 +301,7 @@ func TestChangeBaudSecondParam(t *testing.T) {
 			c := &conn{
 				port:   mock,
 				reader: newSlipReader(mock),
-				isStub: tt.isStub,
+				stub:   tt.isStub,
 			}
 
 			_ = c.changeBaud(tt.newBaud, tt.oldBaud)
@@ -420,6 +420,163 @@ func (m *mockPort) SetRTS(rts bool) error                                { retur
 func (m *mockPort) GetModemStatusBits() (*serial.ModemStatusBits, error) { return nil, nil }
 func (m *mockPort) Break(t time.Duration) error                          { return nil }
 func (m *mockPort) Drain() error                                         { return nil }
+
+// mockConnection implements the connection interface for testing.
+type mockConnection struct {
+	syncFunc                    func() (uint32, error)
+	readRegFunc                 func(addr uint32) (uint32, error)
+	writeRegFunc                func(addr, value, mask, delayUS uint32) error
+	securityInfoFunc            func() ([]byte, error)
+	flashBeginFunc              func(size, offset uint32, encrypted bool) error
+	flashDataFunc               func(block []byte, seq uint32) error
+	flashEndFunc                func(reboot bool) error
+	flashDeflBeginFunc          func(uncompSize, compSize, offset uint32, encrypted bool) error
+	flashDeflDataFunc           func(block []byte, seq uint32) error
+	flashDeflEndFunc            func(reboot bool) error
+	flashMD5Func                func(addr, size uint32) ([]byte, error)
+	flashWriteSizeFunc          func() uint32
+	spiAttachFunc               func(value uint32) error
+	spiSetParamsFunc            func(totalSize, blockSize, sectorSize, pageSize uint32) error
+	changeBaudFunc              func(newBaud, oldBaud uint32) error
+	eraseFlashFunc              func() error
+	eraseRegionFunc             func(offset, size uint32) error
+	flushInputFunc              func()
+	stubMode                    bool
+	supportsEncryptedFlashValue bool
+}
+
+func (m *mockConnection) sync() (uint32, error) {
+	if m.syncFunc != nil {
+		return m.syncFunc()
+	}
+	return 0, nil
+}
+
+func (m *mockConnection) readReg(addr uint32) (uint32, error) {
+	if m.readRegFunc != nil {
+		return m.readRegFunc(addr)
+	}
+	return 0, nil
+}
+
+func (m *mockConnection) writeReg(addr, value, mask, delayUS uint32) error {
+	if m.writeRegFunc != nil {
+		return m.writeRegFunc(addr, value, mask, delayUS)
+	}
+	return nil
+}
+
+func (m *mockConnection) securityInfo() ([]byte, error) {
+	if m.securityInfoFunc != nil {
+		return m.securityInfoFunc()
+	}
+	return nil, nil
+}
+
+func (m *mockConnection) flashBegin(size, offset uint32, encrypted bool) error {
+	if m.flashBeginFunc != nil {
+		return m.flashBeginFunc(size, offset, encrypted)
+	}
+	return nil
+}
+
+func (m *mockConnection) flashData(block []byte, seq uint32) error {
+	if m.flashDataFunc != nil {
+		return m.flashDataFunc(block, seq)
+	}
+	return nil
+}
+
+func (m *mockConnection) flashEnd(reboot bool) error {
+	if m.flashEndFunc != nil {
+		return m.flashEndFunc(reboot)
+	}
+	return nil
+}
+
+func (m *mockConnection) flashDeflBegin(uncompSize, compSize, offset uint32, encrypted bool) error {
+	if m.flashDeflBeginFunc != nil {
+		return m.flashDeflBeginFunc(uncompSize, compSize, offset, encrypted)
+	}
+	return nil
+}
+
+func (m *mockConnection) flashDeflData(block []byte, seq uint32) error {
+	if m.flashDeflDataFunc != nil {
+		return m.flashDeflDataFunc(block, seq)
+	}
+	return nil
+}
+
+func (m *mockConnection) flashDeflEnd(reboot bool) error {
+	if m.flashDeflEndFunc != nil {
+		return m.flashDeflEndFunc(reboot)
+	}
+	return nil
+}
+
+func (m *mockConnection) flashMD5(addr, size uint32) ([]byte, error) {
+	if m.flashMD5Func != nil {
+		return m.flashMD5Func(addr, size)
+	}
+	return nil, nil
+}
+
+func (m *mockConnection) flashWriteSize() uint32 {
+	if m.flashWriteSizeFunc != nil {
+		return m.flashWriteSizeFunc()
+	}
+	return flashWriteSizeROM
+}
+
+func (m *mockConnection) spiAttach(value uint32) error {
+	if m.spiAttachFunc != nil {
+		return m.spiAttachFunc(value)
+	}
+	return nil
+}
+
+func (m *mockConnection) spiSetParams(totalSize, blockSize, sectorSize, pageSize uint32) error {
+	if m.spiSetParamsFunc != nil {
+		return m.spiSetParamsFunc(totalSize, blockSize, sectorSize, pageSize)
+	}
+	return nil
+}
+
+func (m *mockConnection) changeBaud(newBaud, oldBaud uint32) error {
+	if m.changeBaudFunc != nil {
+		return m.changeBaudFunc(newBaud, oldBaud)
+	}
+	return nil
+}
+
+func (m *mockConnection) eraseFlash() error {
+	if m.eraseFlashFunc != nil {
+		return m.eraseFlashFunc()
+	}
+	return nil
+}
+
+func (m *mockConnection) eraseRegion(offset, size uint32) error {
+	if m.eraseRegionFunc != nil {
+		return m.eraseRegionFunc(offset, size)
+	}
+	return nil
+}
+
+func (m *mockConnection) flushInput() {
+	if m.flushInputFunc != nil {
+		m.flushInputFunc()
+	}
+}
+
+func (m *mockConnection) isStub() bool {
+	return m.stubMode
+}
+
+func (m *mockConnection) setSupportsEncryptedFlash(v bool) {
+	m.supportsEncryptedFlashValue = v
+}
 
 // makeFlashBeginResponse creates a mock response for flash begin command.
 func makeFlashBeginResponse() []byte {
