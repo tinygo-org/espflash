@@ -2,6 +2,7 @@ package espflasher
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"testing"
 )
 
@@ -27,20 +28,26 @@ func makeESPImage(mode byte, sizeFreq byte) []byte {
 	return data
 }
 
-// makeESPImageWithSHA creates an ESP image with an appended SHA256 hash.
+// makeESPImageWithSHA creates a properly structured ESP image with an appended
+// SHA256 hash. The image has 0 segments, so the layout is:
+//
+//	header(8) + ext_header(16) + padding(7) + checksum(1) = 32 bytes content
+//	+ 32 bytes SHA256 = 64 bytes total.
+//
 // byte 23 bit 0 = 1 indicates SHA is present.
 func makeESPImageWithSHA(mode byte, sizeFreq byte) []byte {
-	data := make([]byte, 64+32) // 64 bytes content + 32 bytes SHA256
+	data := make([]byte, 32+32) // 32 bytes content + 32 bytes SHA256
 	data[0] = espImageMagic
-	data[1] = 0x00
+	data[1] = 0x00 // segment count = 0
 	data[2] = mode
 	data[3] = sizeFreq
 	data[23] = 0x01 // SHA256 flag
+	// Bytes 24-30: padding (zero), byte 31: checksum (zero)
 
 	// Compute and append valid SHA256
-	content := data[:64]
+	content := data[:32]
 	hash := sha256.Sum256(content)
-	copy(data[64:], hash[:])
+	copy(data[32:], hash[:])
 	return data
 }
 
@@ -370,6 +377,192 @@ func TestFlashModeNames(t *testing.T) {
 		}
 		if got != val {
 			t.Errorf("flashModeNames[%q] = 0x%02X, want 0x%02X", name, got, val)
+		}
+	}
+}
+
+// makeESPImageWithSegments creates a properly structured ESP image with the
+// given number of segments (each segSize bytes). If withSHA is true, a valid
+// SHA256 digest is appended.
+func makeESPImageWithSegments(segCount int, segSize int, withSHA bool) []byte {
+	// Build image content: header + ext_header + segments + alignment + checksum
+	pos := 24 // common header (8) + extended header (16)
+	totalSegData := segCount * (8 + segSize)
+	contentBeforeChecksum := pos + totalSegData
+
+	// Compute aligned data length: pos + 16 - (pos % 16)
+	dataLen := contentBeforeChecksum + 16 - (contentBeforeChecksum % 16)
+	totalLen := dataLen
+	if withSHA {
+		totalLen += 32
+	}
+
+	data := make([]byte, totalLen)
+	data[0] = espImageMagic
+	data[1] = byte(segCount)
+	data[2] = FlashModeDIO
+	data[3] = 0x20 // 4MB, default freq
+	if withSHA {
+		data[23] = 0x01
+	}
+
+	// Write segment headers
+	off := 24
+	for i := 0; i < segCount; i++ {
+		binary.LittleEndian.PutUint32(data[off:], 0x3F400000+uint32(i*segSize)) // addr
+		binary.LittleEndian.PutUint32(data[off+4:], uint32(segSize))            // length
+		off += 8
+		// Fill segment data with non-zero pattern
+		for j := 0; j < segSize; j++ {
+			data[off+j] = byte(i + j + 1)
+		}
+		off += segSize
+	}
+
+	// Compute checksum (XOR of all segment data, matching ROM behavior)
+	chk := byte(0xEF)
+	off = 24
+	for i := 0; i < segCount; i++ {
+		off += 8 // skip segment header
+		for j := 0; j < segSize; j++ {
+			chk ^= data[off+j]
+		}
+		off += segSize
+	}
+	data[dataLen-1] = chk // checksum is last byte of content
+
+	// Compute and append SHA256 if requested
+	if withSHA {
+		hash := sha256.Sum256(data[:dataLen])
+		copy(data[dataLen:], hash[:])
+	}
+
+	return data
+}
+
+func TestImageDataLength(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		expected int
+	}{
+		{
+			name:     "0 segments",
+			data:     makeESPImageWithSegments(0, 0, true),
+			expected: 32, // 24 + 16 - (24%16) = 32
+		},
+		{
+			name:     "1 segment 16 bytes",
+			data:     makeESPImageWithSegments(1, 16, true),
+			expected: 64, // 24+8+16=48, 48+16-(48%16)=64
+		},
+		{
+			name:     "2 segments 32 bytes each",
+			data:     makeESPImageWithSegments(2, 32, true),
+			expected: 112, // 24+2*(8+32)=104, 104+16-(104%16)=112
+		},
+		{
+			name:     "too short",
+			data:     make([]byte, 10),
+			expected: -1,
+		},
+		{
+			name: "bad magic",
+			data: func() []byte {
+				d := makeESPImageWithSegments(0, 0, true)
+				d[0] = 0x00
+				return d
+			}(),
+			expected: -1,
+		},
+		{
+			name: "truncated segment",
+			data: func() []byte {
+				// Create image claiming 1 segment but data too short to hold it
+				d := make([]byte, 40)
+				d[0] = espImageMagic
+				d[1] = 1
+				d[23] = 0x01
+				// Segment at offset 24: addr(4) + len(4)
+				binary.LittleEndian.PutUint32(d[24:], 0x3F400000) // addr
+				binary.LittleEndian.PutUint32(d[28:], 1000)       // claims 1000 bytes
+				return d
+			}(),
+			expected: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := imageDataLength(tt.data)
+			if got != tt.expected {
+				t.Errorf("imageDataLength() = %d, want %d", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestPatchImageHeader_SHA256CombinedBinary(t *testing.T) {
+	// Simulate a combined binary: bootloader image followed by extra data
+	// (partition table + app). The bootloader has append_digest=1.
+	bootloader := makeESPImageWithSegments(1, 16, true)
+	bootloaderDataLen := imageDataLength(bootloader)
+
+	// Append 256 bytes of "extra data" to simulate partition table + app
+	extra := make([]byte, 256)
+	for i := range extra {
+		extra[i] = byte(0xAA + i)
+	}
+	combined := append(bootloader, extra...)
+
+	f := testFlasher(&FlasherOptions{FlashMode: "dout"}, defESP32C3)
+	result, err := f.patchImageHeader(combined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify the bootloader's SHA256 was correctly updated at the right offset
+	expectedHash := sha256.Sum256(result[:bootloaderDataLen])
+	actualHash := result[bootloaderDataLen : bootloaderDataLen+32]
+	for i := 0; i < 32; i++ {
+		if actualHash[i] != expectedHash[i] {
+			t.Errorf("bootloader SHA256 mismatch at byte %d: got 0x%02X, want 0x%02X",
+				i, actualHash[i], expectedHash[i])
+		}
+	}
+
+	// Verify the trailing data (simulating app) was NOT corrupted
+	trailingStart := len(bootloader)
+	for i := 0; i < len(extra); i++ {
+		if result[trailingStart+i] != extra[i] {
+			t.Errorf("trailing data corrupted at offset %d: got 0x%02X, want 0x%02X",
+				i, result[trailingStart+i], extra[i])
+		}
+	}
+}
+
+func TestPatchImageHeader_SHA256WithSegments(t *testing.T) {
+	// Image with 2 segments and SHA256
+	f := testFlasher(&FlasherOptions{FlashMode: "dout"}, defESP32C3)
+	data := makeESPImageWithSegments(2, 32, true)
+
+	result, err := f.patchImageHeader(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify SHA is correct
+	dataLen := imageDataLength(result)
+	if dataLen < 0 {
+		t.Fatal("imageDataLength returned -1")
+	}
+
+	expectedHash := sha256.Sum256(result[:dataLen])
+	actualHash := result[dataLen : dataLen+32]
+	for i := 0; i < 32; i++ {
+		if actualHash[i] != expectedHash[i] {
+			t.Errorf("SHA256 mismatch at byte %d: got 0x%02X, want 0x%02X",
+				i, actualHash[i], expectedHash[i])
 		}
 	}
 }

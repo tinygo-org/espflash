@@ -2,6 +2,7 @@ package espflasher
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 )
 
@@ -108,15 +109,67 @@ func (f *Flasher) patchImageHeader(data []byte) ([]byte, error) {
 
 	// Update SHA256 hash if present.
 	// The extended header is at bytes 8-23, and byte 23 bit 0 indicates SHA256
-	// is appended as the last 32 bytes. ESP8266 doesn't have an extended header,
-	// so skip SHA256 update for it.
+	// is appended after the image content. ESP8266 doesn't have an extended
+	// header, so skip SHA256 update for it.
+	//
+	// We parse the image structure to find the exact offset of the SHA256
+	// digest rather than assuming it is the last 32 bytes. This is critical
+	// for combined/merged binaries where the bootloader image is followed by
+	// partition table and application data.
 	if f.chip != nil && f.chip.ChipType != ChipESP8266 &&
 		len(patched) >= 24+32 && patched[23]&1 != 0 {
-		content := patched[:len(patched)-32]
-		hash := sha256.Sum256(content)
-		copy(patched[len(patched)-32:], hash[:])
-		f.logf("SHA digest in image updated")
+		dataLen := imageDataLength(patched)
+		if dataLen >= 0 && dataLen+32 <= len(patched) {
+			content := patched[:dataLen]
+			hash := sha256.Sum256(content)
+			copy(patched[dataLen:dataLen+32], hash[:])
+			f.logf("SHA digest in image updated")
+		}
 	}
 
 	return patched, nil
+}
+
+// imageDataLength parses an ESP32 firmware image to determine the byte length
+// of the image content before the appended SHA256 digest.
+//
+// The image structure is:
+//   - Common header: 8 bytes (magic, segment_count, flash_mode, size_freq, entry_point)
+//   - Extended header: 16 bytes (wp_pin, drive levels, chip_id, revisions, append_digest)
+//   - N segments: each has an 8-byte header (addr, length) followed by data bytes
+//   - Padding to align to 16 bytes + 1-byte checksum
+//   - SHA256 digest: 32 bytes (if append_digest is set)
+//
+// Returns the offset where the SHA256 digest starts, or -1 if the image
+// cannot be parsed. This is equivalent to esptool's data_length field.
+func imageDataLength(data []byte) int {
+	if len(data) < 24 || data[0] != espImageMagic {
+		return -1
+	}
+
+	segCount := int(data[1])
+	pos := 24 // common header (8) + extended header (16)
+
+	for i := 0; i < segCount; i++ {
+		if pos+8 > len(data) {
+			return -1
+		}
+		segLen := int(binary.LittleEndian.Uint32(data[pos+4 : pos+8]))
+		pos += 8 + segLen
+		if pos > len(data) {
+			return -1
+		}
+	}
+
+	// The checksum byte is placed so the file position becomes a multiple of 16.
+	// This matches esptool's align_file_position(f, 16) + read(1):
+	//   align = (16 - 1) - (pos % 16)   →  skip 'align' padding bytes
+	//   read 1 byte (checksum)
+	//   final position = pos + 16 - (pos % 16)
+	dataLen := pos + 16 - (pos % 16)
+	if dataLen > len(data) {
+		return -1
+	}
+
+	return dataLen
 }
