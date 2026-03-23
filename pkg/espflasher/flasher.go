@@ -357,9 +357,12 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 		}
 	}
 
-	// Use compressed flash only if supported (ESP8266 ROM doesn't support it)
-	canCompress := f.chip == nil || f.chip.ROMHasCompressedFlash || f.conn.isStub()
-	if f.opts.Compress && canCompress {
+	// Use compressed flash only with the stub loader. While most ESP32+ ROM
+	// bootloaders support compressed flash commands, we must skip flashDeflEnd
+	// for ROM (it exits the bootloader), which can leave data unflushed in
+	// the ROM's decompressor buffer. esptool also defaults to uncompressed
+	// writes for ROM (compress = IS_STUB).
+	if f.opts.Compress && f.conn.isStub() {
 		return f.flashCompressed(data, offset, progress)
 	}
 	return f.flashUncompressed(data, offset, progress)
@@ -408,9 +411,6 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 		}
 	}
 
-	// Determine if compressed flash is available
-	canCompress := f.chip == nil || f.chip.ROMHasCompressedFlash || f.conn.isStub()
-
 	totalSize := 0
 	for _, img := range images {
 		totalSize += len(img.Data)
@@ -442,7 +442,7 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 			}
 		}
 
-		if f.opts.Compress && canCompress {
+		if f.opts.Compress && f.conn.isStub() {
 			err = f.flashCompressed(data, img.Offset, partProgress)
 		} else {
 			err = f.flashUncompressed(data, img.Offset, partProgress)
@@ -515,9 +515,18 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 		}
 	}
 
-	// End flash
-	if err := f.conn.flashDeflEnd(false); err != nil {
-		return err
+	// End the compressed flash session.
+	// For ROM bootloaders, skip sending FLASH_DEFL_END — the ROM exits the
+	// bootloader upon receiving it, which can interfere with flash operations.
+	// esptool also skips this for ROM: "skip sending flash_finish to ROM loader,
+	// as it causes the loader to exit and run user code."
+	// For the stub, the end command acts as a write barrier: the stub ACKs each
+	// block on receive but writes to flash asynchronously, so the end command
+	// ensures the last block is actually written before we proceed.
+	if f.conn.isStub() {
+		if err := f.conn.flashDeflEnd(false); err != nil {
+			return err
+		}
 	}
 
 	f.logf("Flash complete. Verifying...")
@@ -577,9 +586,14 @@ func (f *Flasher) flashUncompressed(data []byte, offset uint32, progress Progres
 		}
 	}
 
-	// End flash
-	if err := f.conn.flashEnd(false); err != nil {
-		return err
+	// End the flash session.
+	// For ROM bootloaders, skip sending FLASH_END — the ROM exits the
+	// bootloader upon receiving it. esptool also skips this for ROM.
+	// For the stub, the end command acts as a write barrier.
+	if f.conn.isStub() {
+		if err := f.conn.flashEnd(false); err != nil {
+			return err
+		}
 	}
 
 	f.logf("Flash complete. Verifying...")
@@ -656,11 +670,18 @@ func (f *Flasher) WriteRegister(addr, value uint32) error {
 
 // Reset performs a hard reset of the device, causing it to run user code.
 func (f *Flasher) Reset() {
-	// Try to cleanly exit the stub/rom loader
-	f.conn.flashBegin(0, 0, false) //nolint:errcheck
-	f.conn.flashEnd(true)          //nolint:errcheck
-	time.Sleep(50 * time.Millisecond)
+	if f.conn.isStub() {
+		// The stub loader needs an explicit flash_begin/flash_end to
+		// cleanly exit flash mode before hardware reset.
+		f.conn.flashBegin(0, 0, false) //nolint:errcheck
+		f.conn.flashEnd(true)          //nolint:errcheck
+		time.Sleep(50 * time.Millisecond)
+	}
 
+	// For ROM bootloaders, skip flash_begin/flash_end — sending
+	// CMD_FLASH_BEGIN after a compressed download may interfere with
+	// the flash controller state at offset 0. esptool also just does
+	// a hard reset without any flash commands for the ROM path.
 	hardReset(f.port, false)
 	f.logf("Device reset.")
 }
