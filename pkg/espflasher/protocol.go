@@ -1,8 +1,10 @@
 package espflasher
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"time"
 
 	"go.bug.st/serial"
@@ -458,8 +460,14 @@ func (c *conn) flashDeflEnd(reboot bool) error {
 
 // spiAttach attaches the SPI flash.
 // value=0 for default internal flash.
+// The stub accepts 4 bytes; the ROM bootloader accepts 8 (extra 4 for HSPI config).
 func (c *conn) spiAttach(value uint32) error {
-	data := make([]byte, 8) // 8 bytes (extra 4 for HSPI/SPI config)
+	var data []byte
+	if c.stub {
+		data = make([]byte, 4)
+	} else {
+		data = make([]byte, 8)
+	}
 	binary.LittleEndian.PutUint32(data[0:4], value)
 
 	_, err := c.checkCommand("attach SPI flash", cmdSPIAttach, data, 0, defaultTimeout, 0)
@@ -554,4 +562,92 @@ func eraseTimeoutForSize(size uint32) time.Duration {
 		t = 10 * time.Second
 	}
 	return t
+}
+
+// loadStub uploads the stub flasher to RAM and executes it.
+// The stub provides extended commands like erase_flash, erase_region, and
+// compressed flash writes that are not available in the ROM bootloader.
+func (c *conn) loadStub(s *stub) error {
+	// Upload the text (code) segment.
+	if err := c.uploadToRAM(s.text, s.textStart); err != nil {
+		return fmt.Errorf("upload stub text: %w", err)
+	}
+
+	// Upload the data segment (if any).
+	if len(s.data) > 0 {
+		if err := c.uploadToRAM(s.data, s.dataStart); err != nil {
+			return fmt.Errorf("upload stub data: %w", err)
+		}
+	}
+
+	// Execute the stub at its entry point.
+	// memEnd sends CMD_MEM_END without waiting for a response since the ROM
+	// jumps to the entry point immediately and will not send one.
+	if err := c.memEnd(true, s.entry); err != nil {
+		return fmt.Errorf("execute stub: %w", err)
+	}
+
+	// The stub prints "OHAI" as plain bytes (not SLIP-encoded) when it starts.
+	if err := c.waitForOHAI(); err != nil {
+		return err
+	}
+
+	// Flush any leftover bytes, then reset the SLIP reader so it starts clean.
+	c.port.ResetInputBuffer() //nolint:errcheck
+	c.reader = newSlipReader(c.port)
+	c.stub = true
+	return nil
+}
+
+// uploadToRAM writes a binary segment to the device's RAM via mem_begin/mem_data.
+func (c *conn) uploadToRAM(data []byte, addr uint32) error {
+	dataLen := uint32(len(data))
+	numBlocks := (dataLen + espRAMBlock - 1) / espRAMBlock
+
+	if err := c.memBegin(dataLen, numBlocks, espRAMBlock, addr); err != nil {
+		return err
+	}
+
+	seq := uint32(0)
+	offset := uint32(0)
+	for offset < dataLen {
+		end := offset + espRAMBlock
+		if end > dataLen {
+			end = dataLen
+		}
+		if err := c.memData(data[offset:end], seq); err != nil {
+			return fmt.Errorf("block %d: %w", seq, err)
+		}
+		offset = end
+		seq++
+	}
+	return nil
+}
+
+// waitForOHAI reads raw bytes from the serial port until the stub's "OHAI"
+// startup greeting is received, confirming the stub is running.
+func (c *conn) waitForOHAI() error {
+	const maxBytes = 512
+	var buf []byte
+	single := make([]byte, 32)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		c.port.SetReadTimeout(100 * time.Millisecond) //nolint:errcheck
+		n, err := c.port.Read(single)
+		if n > 0 {
+			buf = append(buf, single[:n]...)
+			if bytes.Contains(buf, []byte("OHAI")) {
+				return nil
+			}
+			// Avoid unbounded growth; keep only the last maxBytes.
+			if len(buf) > maxBytes {
+				buf = buf[len(buf)-maxBytes:]
+			}
+		}
+		if err != nil && err != io.EOF {
+			continue
+		}
+	}
+	return fmt.Errorf("timeout waiting for stub greeting (OHAI)")
 }
