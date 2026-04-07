@@ -108,7 +108,6 @@ func main() {
 		log.Fatalf("Unknown reset mode: %s", *resetMode)
 	}
 
-	fmt.Printf("Connecting to %s...\n", *port)
 	flasher, err := espflasher.New(*port, opts)
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
@@ -118,11 +117,9 @@ func main() {
 	fmt.Printf("Chip: %s\n", flasher.ChipName())
 
 	if *eraseAll {
-		fmt.Println("Erasing entire flash...")
 		if err := flasher.EraseFlash(); err != nil {
 			log.Fatalf("Erase failed: %v", err)
 		}
-		fmt.Println("Flash erased.")
 	}
 
 	progress := func(current, total int) {

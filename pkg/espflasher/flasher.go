@@ -108,6 +108,7 @@ type connection interface {
 	flushInput()
 	isStub() bool
 	setSupportsEncryptedFlash(v bool)
+	loadStub(s *stub) error
 }
 
 // Flasher manages the connection to an ESP device and provides
@@ -249,6 +250,16 @@ synced:
 
 	// Propagate chip capabilities to the connection layer.
 	f.conn.setSupportsEncryptedFlash(f.chip.SupportsEncryptedFlash)
+
+	// Upload the stub loader to enable advanced features (erase, compression, etc.).
+	if s, ok := stubFor(f.chip.ChipType); ok {
+		f.logf("Loading stub loader...")
+		if err := f.conn.loadStub(s); err != nil {
+			f.logf("Warning: could not load stub: %v", err)
+		} else {
+			f.logf("Stub running.")
+		}
+	}
 
 	return nil
 }
@@ -487,7 +498,7 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 	writeSize := f.conn.flashWriteSize()
 	numBlocks := (compSize + writeSize - 1) / writeSize
 
-	f.logf("Flash begin: %d bytes at 0x%08X (%d blocks)", uncompSize, offset, numBlocks)
+	f.logf("Flash begin: %d bytes at 0x%08X (%d compressed blocks)", compSize, offset, numBlocks)
 
 	if err := f.conn.flashDeflBegin(uncompSize, compSize, offset, false); err != nil {
 		return err

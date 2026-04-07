@@ -441,6 +441,7 @@ type mockConnection struct {
 	eraseFlashFunc              func() error
 	eraseRegionFunc             func(offset, size uint32) error
 	flushInputFunc              func()
+	loadStubFunc                func(s *stub) error
 	stubMode                    bool
 	supportsEncryptedFlashValue bool
 }
@@ -576,6 +577,13 @@ func (m *mockConnection) isStub() bool {
 
 func (m *mockConnection) setSupportsEncryptedFlash(v bool) {
 	m.supportsEncryptedFlashValue = v
+}
+
+func (m *mockConnection) loadStub(s *stub) error {
+	if m.loadStubFunc != nil {
+		return m.loadStubFunc(s)
+	}
+	return nil
 }
 
 // makeFlashBeginResponse creates a mock response for flash begin command.
