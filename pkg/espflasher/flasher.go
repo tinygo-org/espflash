@@ -735,7 +735,10 @@ func (f *Flasher) changeBaud(newBaud int) error {
 		return err
 	}
 
-	// Change the local port baud rate
+	// Change the local port baud rate.
+	// Wait before and after SetMode so the USB-UART bridge on all platforms
+	// (especially macOS, where the IOSSIOSPEED ioctl can take extra time)
+	// has settled before we attempt any communication at the new rate.
 	time.Sleep(50 * time.Millisecond)
 	if err := f.port.SetMode(&serial.Mode{
 		BaudRate: newBaud,
@@ -746,8 +749,16 @@ func (f *Flasher) changeBaud(newBaud int) error {
 		return fmt.Errorf("set local baud rate: %w", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 	f.conn.flushInput()
+
+	// Verify the new baud rate works by reading a known register.
+	// On macOS the baud-rate change can take longer to propagate through
+	// the USB-serial driver, so without this check the first real command
+	// (e.g. flash_defl_begin) may time out.
+	if _, err := f.conn.readReg(0x40001000); err != nil {
+		return fmt.Errorf("verify baud rate change: %w", err)
+	}
 
 	f.logf("Running at %d baud.", newBaud)
 	return nil

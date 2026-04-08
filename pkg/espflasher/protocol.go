@@ -550,8 +550,21 @@ func (c *conn) flashWriteSize() uint32 {
 }
 
 // flushInput discards any unread data from the serial port.
+// It first calls ResetInputBuffer (tcflush) and then performs a short
+// read-and-discard loop. On macOS, tcflush does not reliably drain data
+// buffered inside USB-UART bridge drivers, so the extra read pass is
+// necessary to avoid stale bytes corrupting subsequent SLIP frames.
 func (c *conn) flushInput() {
 	c.port.ResetInputBuffer() //nolint:errcheck
+
+	buf := make([]byte, 256)
+	c.port.SetReadTimeout(50 * time.Millisecond) //nolint:errcheck
+	for {
+		n, _ := c.port.Read(buf)
+		if n == 0 {
+			break
+		}
+	}
 }
 
 // eraseTimeoutForSize calculates an appropriate timeout for erase operations.
