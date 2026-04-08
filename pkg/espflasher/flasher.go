@@ -359,12 +359,13 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 		return fmt.Errorf("attach flash: %w", err)
 	}
 
-	// Optionally switch to higher baud rate (not supported by ESP8266 ROM)
+	// Optionally switch to higher baud rate (not supported by ESP8266 ROM).
+	// This is not a soft failure: the remote side has already switched, so
+	// the local port must match or all subsequent commands will time out.
 	canChangeBaud := f.chip == nil || f.chip.ROMHasChangeBaud || f.conn.isStub()
 	if canChangeBaud && f.opts.FlashBaudRate > 0 && f.opts.FlashBaudRate != f.opts.BaudRate {
 		if err := f.changeBaud(f.opts.FlashBaudRate); err != nil {
-			f.logf("Warning: could not change baud rate to %d: %v", f.opts.FlashBaudRate, err)
-			// Continue at original baud rate
+			return fmt.Errorf("change baud rate to %d: %w", f.opts.FlashBaudRate, err)
 		}
 	}
 
@@ -414,11 +415,13 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 		f.opts.FlashMode = "dout"
 	}
 
-	// Optionally switch to higher baud rate (not supported by ESP8266 ROM)
+	// Optionally switch to higher baud rate (not supported by ESP8266 ROM).
+	// This is not a soft failure: the remote side has already switched, so
+	// the local port must match or all subsequent commands will time out.
 	canChangeBaud := f.chip == nil || f.chip.ROMHasChangeBaud || f.conn.isStub()
 	if canChangeBaud && f.opts.FlashBaudRate > 0 && f.opts.FlashBaudRate != f.opts.BaudRate {
 		if err := f.changeBaud(f.opts.FlashBaudRate); err != nil {
-			f.logf("Warning: could not change baud rate to %d: %v", f.opts.FlashBaudRate, err)
+			return fmt.Errorf("change baud rate to %d: %w", f.opts.FlashBaudRate, err)
 		}
 	}
 
@@ -736,10 +739,22 @@ func (f *Flasher) changeBaud(newBaud int) error {
 	}
 
 	// Change the local port baud rate.
-	// Wait before and after SetMode so the USB-UART bridge on all platforms
-	// (especially macOS, where the IOSSIOSPEED ioctl can take extra time)
-	// has settled before we attempt any communication at the new rate.
 	time.Sleep(50 * time.Millisecond)
+
+	// Workaround for macOS: on Darwin, go-serial uses the IOSSIOSPEED ioctl
+	// for non-standard baud rates (e.g. 460800). macOS caches that rate in
+	// the kernel termios state. On the next SetMode call, tcgetattr returns
+	// the cached non-standard value in Ispeed/Ospeed, and tcsetattr rejects
+	// it with EINVAL. Setting a standard rate first clears the cache so the
+	// subsequent SetMode with the target rate succeeds.
+	// See https://github.com/bugst/go-serial/issues/207
+	f.port.SetMode(&serial.Mode{ //nolint:errcheck
+		BaudRate: f.opts.BaudRate,
+		Parity:   serial.NoParity,
+		DataBits: 8,
+		StopBits: serial.OneStopBit,
+	})
+
 	if err := f.port.SetMode(&serial.Mode{
 		BaudRate: newBaud,
 		Parity:   serial.NoParity,
@@ -749,16 +764,8 @@ func (f *Flasher) changeBaud(newBaud int) error {
 		return fmt.Errorf("set local baud rate: %w", err)
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 	f.conn.flushInput()
-
-	// Verify the new baud rate works by reading a known register.
-	// On macOS the baud-rate change can take longer to propagate through
-	// the USB-serial driver, so without this check the first real command
-	// (e.g. flash_defl_begin) may time out.
-	if _, err := f.conn.readReg(0x40001000); err != nil {
-		return fmt.Errorf("verify baud rate change: %w", err)
-	}
 
 	f.logf("Running at %d baud.", newBaud)
 	return nil
