@@ -764,7 +764,9 @@ func (f *Flasher) changeBaud(newBaud int) error {
 		return fmt.Errorf("set local baud rate: %w", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	// Allow the USB-serial hardware to complete the baud rate switch.
+	// On macOS the IOSSIOSPEED ioctl may not take effect immediately.
+	time.Sleep(200 * time.Millisecond)
 	f.conn.flushInput()
 
 	f.logf("Running at %d baud.", newBaud)

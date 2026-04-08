@@ -125,8 +125,24 @@ func (c *conn) sendCommand(opcode byte, data []byte, chk uint32) error {
 	copy(pkt[8:], data)
 
 	frame := slipEncode(pkt)
-	_, err := c.port.Write(frame)
-	return err
+	n, err := c.port.Write(frame)
+	if err != nil {
+		return err
+	}
+	if n < len(frame) {
+		return fmt.Errorf("short write: %d of %d bytes", n, len(frame))
+	}
+
+	// On macOS, Write returns as soon as data is buffered in the kernel,
+	// but USB-serial drivers may not have transmitted it to the device yet.
+	// Drain blocks until all buffered output has been physically sent.
+	// Without this, the subsequent Read can time out if the device hasn't
+	// received the command yet.
+	if err := c.port.Drain(); err != nil {
+		return fmt.Errorf("drain: %w", err)
+	}
+
+	return nil
 }
 
 // commandResponse represents a parsed response from the ESP device.
