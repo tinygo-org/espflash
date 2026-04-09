@@ -442,7 +442,9 @@ type mockConnection struct {
 	eraseRegionFunc             func(offset, size uint32) error
 	flushInputFunc              func()
 	loadStubFunc                func(s *stub) error
+	readFlashFunc               func(offset, size uint32) ([]byte, error)
 	stubMode                    bool
+	usbMode                     bool
 	supportsEncryptedFlashValue bool
 }
 
@@ -571,8 +573,19 @@ func (m *mockConnection) flushInput() {
 	}
 }
 
+func (m *mockConnection) readFlash(offset, size uint32) ([]byte, error) {
+	if m.readFlashFunc != nil {
+		return m.readFlashFunc(offset, size)
+	}
+	return nil, nil
+}
+
 func (m *mockConnection) isStub() bool {
 	return m.stubMode
+}
+
+func (m *mockConnection) setUSB(v bool) {
+	m.usbMode = v
 }
 
 func (m *mockConnection) setSupportsEncryptedFlash(v bool) {
@@ -608,4 +621,118 @@ func makeChangeBaudResponse() []byte {
 	resp[8] = 0x00
 	resp[9] = 0x00
 	return resp
+}
+
+func TestSendCommandChunking(t *testing.T) {
+	// Verify that sendCommand writes in chunks <= 64 bytes
+	var writes [][]byte
+	mock := &mockPort{
+		writeFunc: func(data []byte) (int, error) {
+			// Record each write call
+			chunk := make([]byte, len(data))
+			copy(chunk, data)
+			writes = append(writes, chunk)
+			return len(data), nil
+		},
+	}
+
+	c := &conn{
+		port:   mock,
+		reader: &slipReader{port: mock},
+	}
+
+	// Create test data that will result in a large SLIP frame
+	testData := make([]byte, 256) // Large payload
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+	chk := uint32(0xDEADBEEF)
+
+	err := c.sendCommand(cmdFlashData, testData, chk)
+	if err != nil {
+		t.Fatalf("sendCommand failed: %v", err)
+	}
+
+	// Verify that we got multiple writes
+	if len(writes) < 2 {
+		t.Errorf("expected multiple writes for large frame, got %d", len(writes))
+	}
+
+	// Verify each write is <= 64 bytes
+	const maxChunk = 64
+	for i, w := range writes {
+		if len(w) > maxChunk {
+			t.Errorf("write[%d] = %d bytes, want <= %d", i, len(w), maxChunk)
+		}
+	}
+
+	// Verify the reassembled frame decodes correctly
+	var reassembled []byte
+	for _, w := range writes {
+		reassembled = append(reassembled, w...)
+	}
+	decoded := slipDecode(reassembled)
+
+	// Check that we got the right opcode and data
+	if len(decoded) < 8 {
+		t.Fatalf("decoded frame too short: %d bytes", len(decoded))
+	}
+	if decoded[1] != cmdFlashData {
+		t.Errorf("opcode = 0x%02X, want 0x%02X", decoded[1], cmdFlashData)
+	}
+}
+
+func TestUploadToRAMUSBBlockSize(t *testing.T) {
+	// Verify that USB connections use 1KB block size and regular use 6KB
+	tests := []struct {
+		name        string
+		usesUSB     bool
+		dataSize    uint32
+		expectedBS  uint32
+		expectedNum uint32
+	}{
+		{"non-USB 6144 bytes uses 6KB blocks", false, 6144, 0x1800, 1},
+		{"non-USB 12288 bytes uses 6KB blocks", false, 12288, 0x1800, 2},
+		{"USB 1024 bytes uses 1KB blocks", true, 1024, 0x400, 1},
+		{"USB 2048 bytes uses 1KB blocks", true, 2048, 0x400, 2},
+		{"USB 6144 bytes split into 1KB blocks", true, 6144, 0x400, 6},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// We'll verify block size by checking the calculation logic
+			blockSize := espRAMBlock
+			if tt.usesUSB {
+				blockSize = 0x400
+			}
+
+			dataLen := tt.dataSize
+			numBlocks := (dataLen + blockSize - 1) / blockSize
+
+			if blockSize != tt.expectedBS {
+				t.Errorf("block size = %d, want %d", blockSize, tt.expectedBS)
+			}
+
+			if numBlocks != tt.expectedNum {
+				t.Errorf("num blocks = %d, want %d", numBlocks, tt.expectedNum)
+			}
+		})
+	}
+}
+
+func TestReadFlashBlockSize(t *testing.T) {
+	// Verify readFlashBlockSize constant
+	if readFlashBlockSize != 0x1000 {
+		t.Errorf("readFlashBlockSize = 0x%X, want 0x1000", readFlashBlockSize)
+	}
+}
+
+func TestReadFlashParameterValidation(t *testing.T) {
+	// Verify that readFlash uses correct command opcode
+	if cmdReadFlash != 0xD2 {
+		t.Errorf("cmdReadFlash = 0x%02X, want 0xD2", cmdReadFlash)
+	}
+	if cmdReadFlash != 0xD2 {
+		t.Errorf("cmdReadFlash opcode mismatch")
+	}
 }

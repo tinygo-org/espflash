@@ -117,6 +117,11 @@ type chipDef struct {
 
 	// FlashSizes maps size strings to header byte values.
 	FlashSizes map[string]byte
+
+	// PostConnect is called after chip detection to perform chip-specific
+	// initialization (e.g. USB interface detection, watchdog disable).
+	// May set Flasher fields like usesUSB.
+	PostConnect func(f *Flasher) error
 }
 
 // chipDetectMagicRegAddr is the register address that has a different

@@ -68,7 +68,8 @@ func slipDecode(frame []byte) []byte {
 
 // slipReader reads complete SLIP frames from a serial port.
 type slipReader struct {
-	port serial.Port
+	port     serial.Port
+	leftover []byte
 }
 
 // newSlipReader creates a SLIP frame reader for the given serial port.
@@ -84,35 +85,12 @@ func (r *slipReader) ReadFrame(timeout time.Duration) ([]byte, error) {
 	inFrame := false
 	inEscape := false
 
-	buf := make([]byte, 256)
-
-	for time.Now().Before(deadline) {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
-		}
-
-		readTimeout := min(remaining, 100*time.Millisecond)
-		r.port.SetReadTimeout(readTimeout)
-
-		n, err := r.port.Read(buf)
-		if err != nil && err != io.EOF {
-			// On timeout, continue; on real error, return
-			if n == 0 {
-				continue
-			}
-		}
-		if n == 0 {
-			continue
-		}
-
-		for i := range n {
-			b := buf[i]
-
+	processBytes := func(data []byte) ([]byte, bool, error) {
+		for i, b := range data {
 			if !inFrame {
 				if b == slipEnd {
 					inFrame = true
-					partial = partial[:0] // reset
+					partial = partial[:0]
 				}
 				continue
 			}
@@ -125,7 +103,7 @@ func (r *slipReader) ReadFrame(timeout time.Duration) ([]byte, error) {
 				case slipEscEsc:
 					partial = append(partial, slipEsc)
 				default:
-					return nil, fmt.Errorf("invalid SLIP escape: 0xDB 0x%02X", b)
+					return nil, false, fmt.Errorf("invalid SLIP escape: 0xDB 0x%02X", b)
 				}
 				continue
 			}
@@ -135,14 +113,52 @@ func (r *slipReader) ReadFrame(timeout time.Duration) ([]byte, error) {
 				if len(partial) > 0 {
 					result := make([]byte, len(partial))
 					copy(result, partial)
-					return result, nil
+					remaining := data[i+1:]
+					r.leftover = make([]byte, len(remaining))
+					copy(r.leftover, remaining)
+					return result, true, nil
 				}
-				// Empty frame, keep reading
 			case slipEsc:
 				inEscape = true
 			default:
 				partial = append(partial, b)
 			}
+		}
+		return nil, false, nil
+	}
+
+	// Process leftover bytes first
+	if len(r.leftover) > 0 {
+		saved := r.leftover
+		r.leftover = nil
+		if result, done, err := processBytes(saved); err != nil {
+			return nil, err
+		} else if done {
+			return result, nil
+		}
+	}
+
+	buf := make([]byte, 256)
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		readTimeout := min(remaining, 100*time.Millisecond)
+		r.port.SetReadTimeout(readTimeout) //nolint:errcheck
+		n, err := r.port.Read(buf)
+		if err != nil && err != io.EOF {
+			if n == 0 {
+				continue
+			}
+		}
+		if n == 0 {
+			continue
+		}
+		if result, done, err := processBytes(buf[:n]); err != nil {
+			return nil, err
+		} else if done {
+			return result, nil
 		}
 	}
 
