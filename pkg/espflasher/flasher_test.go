@@ -8,6 +8,28 @@ import (
 	"testing"
 )
 
+func TestResetModeString(t *testing.T) {
+	tests := []struct {
+		mode ResetMode
+		want string
+	}{
+		{ResetDefault, "default"},
+		{ResetNoReset, "no-reset"},
+		{ResetUSBJTAG, "usb-jtag"},
+		{ResetAuto, "auto"},
+		{ResetMode(99), "unknown(99)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			got := tt.mode.String()
+			if got != tt.want {
+				t.Errorf("String() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDefaultOptions(t *testing.T) {
 	opts := DefaultOptions()
 

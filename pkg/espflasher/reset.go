@@ -1,6 +1,7 @@
 package espflasher
 
 import (
+	"fmt"
 	"time"
 
 	"go.bug.st/serial"
@@ -19,6 +20,11 @@ const (
 
 	// ResetUSBJTAG uses the USB-JTAG/Serial reset sequence (ESP32-S3, ESP32-C3, etc.).
 	ResetUSBJTAG
+
+	// ResetAuto tries multiple reset strategies in sequence.
+	// First attempts DTR/RTS classic reset, then USB-JTAG, then no-signal.
+	// Useful when the interface type is unknown.
+	ResetAuto
 )
 
 const (
@@ -110,5 +116,21 @@ func hardReset(port serial.Port, usesUSB bool) {
 	} else {
 		time.Sleep(100 * time.Millisecond)
 		port.SetRTS(false) //nolint:errcheck
+	}
+}
+
+// String returns the string representation of the ResetMode.
+func (r ResetMode) String() string {
+	switch r {
+	case ResetDefault:
+		return "default"
+	case ResetNoReset:
+		return "no-reset"
+	case ResetUSBJTAG:
+		return "usb-jtag"
+	case ResetAuto:
+		return "auto"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(r))
 	}
 }

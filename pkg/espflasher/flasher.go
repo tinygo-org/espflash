@@ -211,6 +211,15 @@ func (f *Flasher) connect() error {
 			}
 		case ResetUSBJTAG:
 			usbJTAGSerialReset(f.port)
+		case ResetAuto:
+			switch attempt % 3 {
+			case 0:
+				classicReset(f.port, defaultResetDelay)
+			case 1:
+				usbJTAGSerialReset(f.port)
+			case 2:
+				// No reset — device may already be in bootloader
+			}
 		}
 		// ResetNoReset: skip reset entirely
 
