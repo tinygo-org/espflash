@@ -1,5 +1,12 @@
 package espflasher
 
+// ESP32-S2 register addresses for USB interface detection.
+// Reference: esptool/targets/esp32s2.py
+const (
+	esp32s2UARTDevBufNo       uint32 = 0x3FFFFD14 // ROM .bss: active console interface
+	esp32s2UARTDevBufNoUSBOTG uint32 = 2          // USB-OTG active
+)
+
 // ESP32-S2 target definition.
 // Reference: https://github.com/espressif/esptool/blob/master/esptool/targets/esp32s2.py
 
@@ -41,4 +48,26 @@ var defESP32S2 = &chipDef{
 	},
 
 	FlashSizes: defaultFlashSizes(),
+
+	PostConnect: esp32s2PostConnect,
+}
+
+// esp32s2PostConnect detects the USB interface type.
+// ESP32-S2 only has USB-OTG (no USB-JTAG/Serial), and does not require
+// watchdog disable for USB operation.
+// Reference: esptool/targets/esp32s2.py _post_connect()
+func esp32s2PostConnect(f *Flasher) error {
+	uartDev, err := f.ReadRegister(esp32s2UARTDevBufNo)
+	if err != nil {
+		// In secure download mode, the register may be unreadable.
+		// Default to non-USB behavior (safe fallback).
+		return nil
+	}
+
+	if uartDev == esp32s2UARTDevBufNoUSBOTG {
+		f.usesUSB = true
+		f.logf("USB-OTG interface detected")
+	}
+
+	return nil
 }
