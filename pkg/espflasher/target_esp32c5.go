@@ -1,5 +1,17 @@
 package espflasher
 
+// ESP32-C5 register addresses for USB interface detection and watchdog control.
+// Reference: esptool/targets/esp32c5.py
+const (
+	esp32c5UARTDevBufNo              uint32 = 0x4085F514 // ROM .bss: active console interface
+	esp32c5UARTDevBufNoUSBJTAGSerial uint32 = 3          // USB-JTAG/Serial active
+
+	esp32c5LPWDTConfig0     uint32 = 0x600B1C00
+	esp32c5LPWDTWProtect    uint32 = 0x600B1C18
+	esp32c5LPWDTSWDConf     uint32 = 0x600B1C1C
+	esp32c5LPWDTSWDWProtect uint32 = 0x600B1C20
+)
+
 // ESP32-C5 target definition.
 // Reference: https://github.com/espressif/esptool/blob/master/esptool/targets/esp32c5.py
 
@@ -39,4 +51,27 @@ var defESP32C5 = &chipDef{
 	},
 
 	FlashSizes: defaultFlashSizes(),
+
+	PostConnect: esp32c5PostConnect,
+}
+
+// esp32c5PostConnect detects the USB interface type and disables watchdogs
+// when connected via USB-JTAG/Serial. Without this, the LP WDT fires
+// during flash and resets the chip mid-operation.
+// Reference: esptool/targets/esp32c5.py _post_connect()
+func esp32c5PostConnect(f *Flasher) error {
+	uartDev, err := f.ReadRegister(esp32c5UARTDevBufNo)
+	if err != nil {
+		// In secure download mode, the register may be unreadable.
+		// Default to non-USB behavior (safe fallback).
+		return nil
+	}
+
+	if uartDev == esp32c5UARTDevBufNoUSBJTAGSerial {
+		f.usesUSB = true
+		f.logf("USB-JTAG/Serial interface detected, disabling watchdogs")
+		return disableWatchdogsLP(f, esp32c5LPWDTConfig0, esp32c5LPWDTWProtect, esp32c5LPWDTSWDConf, esp32c5LPWDTSWDWProtect)
+	}
+
+	return nil
 }
