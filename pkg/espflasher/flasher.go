@@ -119,6 +119,7 @@ type Flasher struct {
 	chip    *chipDef
 	opts    *FlasherOptions
 	portStr string
+	secInfo []byte // cached security info from ROM (GET_SECURITY_INFO opcode 0x14)
 }
 
 // New creates a new Flasher connected to the given serial port.
@@ -665,8 +666,13 @@ func (f *Flasher) EraseFlash() error {
 }
 
 // EraseRegion erases a region of flash memory.
+// Requires the stub loader to be running.
 // Both offset and size must be aligned to the flash sector size (4096 bytes).
 func (f *Flasher) EraseRegion(offset, size uint32) error {
+	if !f.conn.isStub() {
+		return &UnsupportedCommandError{Command: "erase region (requires stub)"}
+	}
+
 	if offset%flashSectorSize != 0 {
 		return fmt.Errorf("offset 0x%X is not aligned to sector size 0x%X", offset, flashSectorSize)
 	}
@@ -686,6 +692,29 @@ func (f *Flasher) ReadRegister(addr uint32) (uint32, error) {
 // WriteRegister writes a 32-bit value to a register on the device.
 func (f *Flasher) WriteRegister(addr, value uint32) error {
 	return f.conn.writeReg(addr, value, 0xFFFFFFFF, 0)
+}
+
+// GetSecurityInfo returns security-related information from the device.
+func (f *Flasher) GetSecurityInfo() (*SecurityInfo, error) {
+	return f.readSecurityInfo()
+}
+
+// GetMD5 returns the MD5 hash of a flash region.
+// Requires the stub loader to be running.
+func (f *Flasher) GetMD5(offset, size uint32) (string, error) {
+	if !f.conn.isStub() {
+		return "", &UnsupportedCommandError{Command: "flash MD5 (requires stub)"}
+	}
+
+	if err := f.attachFlash(); err != nil {
+		return "", err
+	}
+
+	result, err := f.conn.flashMD5(offset, size)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(result), nil
 }
 
 // Reset performs a hard reset of the device, causing it to run user code.

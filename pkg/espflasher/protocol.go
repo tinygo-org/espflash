@@ -284,6 +284,7 @@ func (c *conn) writeReg(addr, value, mask, delayUS uint32) error {
 // securityInfo reads security-related information from the device.
 // Try with 20 bytes first (most chips), fallback to 12 bytes (ESP32-S2).
 func (c *conn) securityInfo() ([]byte, error) {
+	c.flushInput()
 	data := make([]byte, 20)
 
 	result, err := c.checkCommand("get security info", cmdSecurityInfoReg, data, 0, defaultTimeout, 20)

@@ -433,3 +433,46 @@ func TestFlashSizeFromJEDECMatchesChipSizes(t *testing.T) {
 		}
 	}
 }
+
+func TestGetMD5RequiresStub(t *testing.T) {
+	mock := &mockConnection{}
+	mock.stubMode = false // ROM mode
+	f := &Flasher{conn: mock, chip: chipDefs[ChipESP32]}
+	_, err := f.GetMD5(0, 1024)
+	if err == nil {
+		t.Fatal("expected error when stub is not running")
+	}
+	if ue, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	} else if ue.Command != "flash MD5 (requires stub)" {
+		t.Errorf("unexpected error message: %s", ue.Command)
+	}
+}
+
+func TestGetSecurityInfo(t *testing.T) {
+	secInfo := make([]byte, 20)
+	binary.LittleEndian.PutUint32(secInfo[0:4], 0x05)
+	secInfo[4] = 0x02
+	binary.LittleEndian.PutUint32(secInfo[12:16], 0x1234)
+	binary.LittleEndian.PutUint32(secInfo[16:20], 0x0200)
+
+	mock := &mockConnection{}
+	mock.securityInfoFunc = func() ([]byte, error) {
+		return secInfo, nil
+	}
+	f := &Flasher{conn: mock}
+	info, err := f.GetSecurityInfo()
+	if err != nil {
+		t.Fatalf("GetSecurityInfo failed: %v", err)
+	}
+	if info == nil {
+		t.Fatal("expected non-nil SecurityInfo")
+	}
+	if info.ChipID == nil || *info.ChipID != 0x1234 {
+		if info.ChipID != nil {
+			t.Errorf("unexpected chip ID: got 0x%X, want 0x1234", *info.ChipID)
+		} else {
+			t.Error("unexpected nil ChipID")
+		}
+	}
+}
