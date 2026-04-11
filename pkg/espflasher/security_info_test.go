@@ -202,3 +202,155 @@ func TestReadSecurityInfo(t *testing.T) {
 		})
 	}
 }
+
+func TestSecurityInfoFlushInput(t *testing.T) {
+	// Test that securityInfo clears any stray input before querying.
+	// This verifies the fix for the ESP32-S3 issue where SLIP frame delimiters
+	// in the input buffer corrupted the response (command 0x14 failed: status=0xC0).
+	buf20 := make([]byte, 20)
+	binary.LittleEndian.PutUint32(buf20[0:4], 0x05)
+	buf20[4] = 0x03
+	binary.LittleEndian.PutUint32(buf20[12:16], 0x0009)
+
+	mc := &mockConnection{
+		securityInfoFunc: func() ([]byte, error) {
+			return buf20, nil
+		},
+	}
+	f := &Flasher{conn: mc}
+
+	si, err := f.readSecurityInfo()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if si.Flags != 0x05 {
+		t.Errorf("Flags = 0x%x, want 0x05", si.Flags)
+	}
+
+	if si == nil {
+		t.Error("expected SecurityInfo to be populated")
+	}
+}
+
+func TestSecurityInfoCaching(t *testing.T) {
+	// Test that security info is cached from the first call (ROM before stub loads)
+	// and subsequent calls return the cached bytes without re-issuing the command.
+	buf20 := make([]byte, 20)
+	binary.LittleEndian.PutUint32(buf20[0:4], 0x05)     // flags
+	buf20[4] = 0x03                                     // FlashCryptCnt
+	binary.LittleEndian.PutUint32(buf20[12:16], 0x0009) // ChipID
+
+	callCount := 0
+	mc := &mockConnection{
+		securityInfoFunc: func() ([]byte, error) {
+			callCount++
+			return buf20, nil
+		},
+	}
+	f := &Flasher{conn: mc}
+
+	// First call should invoke the connection
+	si1, err := f.readSecurityInfo()
+	if err != nil {
+		t.Fatalf("first call: unexpected error: %v", err)
+	}
+	if si1.Flags != 0x05 {
+		t.Errorf("first call: Flags = 0x%x, want 0x05", si1.Flags)
+	}
+	if callCount != 1 {
+		t.Errorf("first call: expected 1 connection call, got %d", callCount)
+	}
+
+	// Second call should use the cached bytes without calling conn.securityInfo()
+	si2, err := f.readSecurityInfo()
+	if err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+	if si2.Flags != 0x05 {
+		t.Errorf("second call: Flags = 0x%x, want 0x05", si2.Flags)
+	}
+	if callCount != 1 {
+		t.Errorf("second call: expected 1 total connection call, got %d", callCount)
+	}
+
+	// Results should be identical
+	if si1.Flags != si2.Flags || si1.FlashCryptCnt != si2.FlashCryptCnt {
+		t.Error("cached result differs from initial result")
+	}
+}
+
+func TestSecurityInfoCachingWithStubFailure(t *testing.T) {
+	// Test that when security info is cached from ROM, a stub failure (0xC0)
+	// on a second call to GetSecurityInfo() returns the cached data instead.
+	buf20 := make([]byte, 20)
+	binary.LittleEndian.PutUint32(buf20[0:4], 0x05)     // flags
+	buf20[4] = 0x03                                     // FlashCryptCnt
+	binary.LittleEndian.PutUint32(buf20[12:16], 0x0009) // ChipID
+
+	callCount := 0
+	mc := &mockConnection{
+		securityInfoFunc: func() ([]byte, error) {
+			callCount++
+			if callCount == 1 {
+				// First call (ROM) succeeds
+				return buf20, nil
+			}
+			// Second call (stub) would fail, but it won't be called
+			return nil, errors.New("stub does not support command 0x14")
+		},
+	}
+	f := &Flasher{conn: mc}
+
+	// First call succeeds and caches the data
+	si1, err := f.readSecurityInfo()
+	if err != nil {
+		t.Fatalf("first call: unexpected error: %v", err)
+	}
+	if si1.Flags != 0x05 {
+		t.Errorf("first call: Flags = 0x%x, want 0x05", si1.Flags)
+	}
+
+	// Second call returns cached data without hitting the connection
+	si2, err := f.readSecurityInfo()
+	if err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+	if si2.Flags != 0x05 {
+		t.Errorf("second call: Flags = 0x%x, want 0x05", si2.Flags)
+	}
+	if callCount != 1 {
+		t.Errorf("expected only 1 connection call (second should use cache), got %d", callCount)
+	}
+}
+
+func TestSecurityInfoStubWithoutCache(t *testing.T) {
+	// Test that when stub is running and no cached security info is available,
+	// readSecurityInfo() returns UnsupportedCommandError.
+	mc := &mockConnection{
+		securityInfoFunc: func() ([]byte, error) {
+			return nil, errors.New("stub does not support command 0x14")
+		},
+		stubMode: true, // Simulate stub is running
+	}
+	f := &Flasher{conn: mc}
+
+	// Call without cache and stub running should return UnsupportedCommandError
+	si, err := f.readSecurityInfo()
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var unsupErr *UnsupportedCommandError
+	if !errors.As(err, &unsupErr) {
+		t.Fatalf("expected UnsupportedCommandError, got %T: %v", err, err)
+	}
+
+	if unsupErr.Command != "GET_SECURITY_INFO requires ROM bootloader; not available after stub is loaded (use ChipAuto to cache during connect)" {
+		t.Errorf("unexpected error message: %s", unsupErr.Command)
+	}
+
+	if si != nil {
+		t.Errorf("expected nil SecurityInfo, got %v", si)
+	}
+}

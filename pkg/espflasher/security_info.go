@@ -30,9 +30,27 @@ type ParsedFlags struct {
 }
 
 func (f *Flasher) readSecurityInfo() (*SecurityInfo, error) {
-	res, err := f.conn.securityInfo()
-	if err != nil {
-		return nil, err
+	var res []byte
+	var err error
+
+	// Use cached security info if available (from ROM before stub was loaded)
+	if len(f.secInfo) > 0 {
+		res = f.secInfo
+	} else {
+		// GET_SECURITY_INFO (opcode 0x14) is ROM-only; stub returns 0xC0.
+		// If stub is loaded and we have no cached info, it's too late.
+		if f.conn.isStub() {
+			return nil, &UnsupportedCommandError{
+				Command: "GET_SECURITY_INFO requires ROM bootloader; not available after stub is loaded (use ChipAuto to cache during connect)",
+			}
+		}
+
+		res, err = f.conn.securityInfo()
+		if err != nil {
+			return nil, err
+		}
+		// Cache the raw bytes for future calls
+		f.secInfo = res
 	}
 
 	var si SecurityInfo
