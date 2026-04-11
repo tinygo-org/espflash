@@ -59,6 +59,9 @@ const (
 	// flashSectorSize is the minimum flash erase unit.
 	flashSectorSize uint32 = 0x1000 // 4KB
 
+	// readFlashBlockSize is the block size for read flash operations.
+	readFlashBlockSize uint32 = 0x1000 // 4KB
+
 	// espImageMagic is the first byte of a valid ESP firmware image.
 	espImageMagic byte = 0xE9
 
@@ -79,7 +82,8 @@ const (
 type conn struct {
 	port   serial.Port
 	reader *slipReader
-	stub   bool
+	stub    bool
+	usesUSB bool // set for USB-OTG and USB-JTAG/Serial connections
 	// supportsEncryptedFlash indicates the ROM supports the 5th parameter
 	// (encrypted flag) in flash_begin/flash_defl_begin commands.
 	// Set based on chip type after detection.
@@ -89,6 +93,11 @@ type conn struct {
 // isStub returns whether the stub loader is running.
 func (c *conn) isStub() bool {
 	return c.stub
+}
+
+// setUSB sets whether the connection uses USB-OTG or USB-JTAG endpoints.
+func (c *conn) setUSB(v bool) {
+	c.usesUSB = v
 }
 
 // setSupportsEncryptedFlash sets whether the ROM supports encrypted flash commands.
@@ -125,8 +134,20 @@ func (c *conn) sendCommand(opcode byte, data []byte, chk uint32) error {
 	copy(pkt[8:], data)
 
 	frame := slipEncode(pkt)
-	_, err := c.port.Write(frame)
-	return err
+	// USB CDC endpoints have limited buffer sizes. Writing large SLIP frames
+	// in one shot can overflow the endpoint buffer and cause data loss.
+	// Chunk writes to 64 bytes (standard USB Full Speed bulk endpoint size).
+	const maxChunk = 64
+	for off := 0; off < len(frame); off += maxChunk {
+		end := off + maxChunk
+		if end > len(frame) {
+			end = len(frame)
+		}
+		if _, err := c.port.Write(frame[off:end]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // commandResponse represents a parsed response from the ESP device.
@@ -542,6 +563,51 @@ func (c *conn) eraseRegion(offset, size uint32) error {
 	return err
 }
 
+// readFlash reads data from flash memory (stub-only).
+func (c *conn) readFlash(offset, size uint32) ([]byte, error) {
+	data := make([]byte, 16)
+	binary.LittleEndian.PutUint32(data[0:4], offset)
+	binary.LittleEndian.PutUint32(data[4:8], size)
+	binary.LittleEndian.PutUint32(data[8:12], readFlashBlockSize)
+	binary.LittleEndian.PutUint32(data[12:16], 64) // max_inflight (stub clamps to 1)
+
+	if _, err := c.checkCommand("read flash", cmdReadFlash, data, 0, defaultTimeout, 0); err != nil {
+		return nil, err
+	}
+
+	blockTimeout := defaultTimeout + time.Duration(readFlashBlockSize/256)*100*time.Millisecond
+	numBlocks := (size + readFlashBlockSize - 1) / readFlashBlockSize
+	result := make([]byte, 0, size)
+
+	for i := uint32(0); i < numBlocks; i++ {
+		// Read SLIP-framed data block
+		block, err := c.reader.ReadFrame(blockTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("read flash block %d/%d: %w", i+1, numBlocks, err)
+		}
+		result = append(result, block...)
+
+		// Send ACK: cumulative bytes received (SLIP-framed)
+		ack := make([]byte, 4)
+		binary.LittleEndian.PutUint32(ack, uint32(len(result)))
+		ackFrame := slipEncode(ack)
+		if _, err := c.port.Write(ackFrame); err != nil {
+			return nil, fmt.Errorf("read flash ACK %d/%d: %w", i+1, numBlocks, err)
+		}
+	}
+
+	// Read final 16-byte MD5 digest (SLIP-framed)
+	_, err := c.reader.ReadFrame(defaultTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("read flash MD5: %w", err)
+	}
+
+	if uint32(len(result)) > size {
+		result = result[:size]
+	}
+	return result, nil
+}
+
 // flashWriteSize returns the appropriate block size based on loader type.
 func (c *conn) flashWriteSize() uint32 {
 	if c.stub {
@@ -602,17 +668,24 @@ func (c *conn) loadStub(s *stub) error {
 
 // uploadToRAM writes a binary segment to the device's RAM via mem_begin/mem_data.
 func (c *conn) uploadToRAM(data []byte, addr uint32) error {
-	dataLen := uint32(len(data))
-	numBlocks := (dataLen + espRAMBlock - 1) / espRAMBlock
+	// USB CDC endpoints have limited buffer sizes. Use 1KB blocks for
+	// USB connections instead of the default 6KB to avoid timeout.
+	blockSize := espRAMBlock
+	if c.usesUSB {
+		blockSize = 0x400 // 1KB
+	}
 
-	if err := c.memBegin(dataLen, numBlocks, espRAMBlock, addr); err != nil {
+	dataLen := uint32(len(data))
+	numBlocks := (dataLen + blockSize - 1) / blockSize
+
+	if err := c.memBegin(dataLen, numBlocks, blockSize, addr); err != nil {
 		return err
 	}
 
 	seq := uint32(0)
 	offset := uint32(0)
 	for offset < dataLen {
-		end := offset + espRAMBlock
+		end := offset + blockSize
 		if end > dataLen {
 			end = dataLen
 		}

@@ -449,6 +449,21 @@ func TestGetMD5RequiresStub(t *testing.T) {
 	}
 }
 
+func TestReadFlashRequiresStub(t *testing.T) {
+	mock := &mockConnection{}
+	mock.stubMode = false // ROM mode
+	f := &Flasher{conn: mock, chip: chipDefs[ChipESP32]}
+	_, err := f.ReadFlash(0, 1024)
+	if err == nil {
+		t.Fatal("expected error when stub is not running")
+	}
+	if ue, ok := err.(*UnsupportedCommandError); !ok {
+		t.Errorf("expected UnsupportedCommandError, got %T: %v", err, err)
+	} else if ue.Command != "read flash (requires stub)" {
+		t.Errorf("unexpected error message: %s", ue.Command)
+	}
+}
+
 func TestGetSecurityInfo(t *testing.T) {
 	secInfo := make([]byte, 20)
 	binary.LittleEndian.PutUint32(secInfo[0:4], 0x05)

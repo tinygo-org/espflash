@@ -105,8 +105,10 @@ type connection interface {
 	changeBaud(newBaud, oldBaud uint32) error
 	eraseFlash() error
 	eraseRegion(offset, size uint32) error
+	readFlash(offset, size uint32) ([]byte, error)
 	flushInput()
 	isStub() bool
+	setUSB(v bool)
 	setSupportsEncryptedFlash(v bool)
 	loadStub(s *stub) error
 }
@@ -119,6 +121,7 @@ type Flasher struct {
 	chip    *chipDef
 	opts    *FlasherOptions
 	portStr string
+	usesUSB bool
 	secInfo []byte // cached security info from ROM (GET_SECURITY_INFO opcode 0x14)
 }
 
@@ -163,7 +166,7 @@ func New(portName string, opts *FlasherOptions) (*Flasher, error) {
 
 	// Connect to the bootloader
 	if err := f.connect(); err != nil {
-		port.Close() //nolint:errcheck
+		f.port.Close() //nolint:errcheck
 		return nil, err
 	}
 
@@ -173,6 +176,31 @@ func New(portName string, opts *FlasherOptions) (*Flasher, error) {
 // Close releases the serial port and associated resources.
 func (f *Flasher) Close() error {
 	return f.port.Close()
+}
+
+// reopenPort closes and reopens the serial port after a USB device
+// re-enumeration. TinyUSB CDC devices may briefly disappear during reset.
+func (f *Flasher) reopenPort() error {
+	f.port.Close() //nolint:errcheck
+
+	var lastErr error
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		port, err := serial.Open(f.portStr, &serial.Mode{
+			BaudRate: f.opts.BaudRate,
+			Parity:   serial.NoParity,
+			DataBits: 8,
+			StopBits: serial.OneStopBit,
+		})
+		if err == nil {
+			f.port = port
+			f.conn = newConn(port)
+			return nil
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("reopen port %s: %w", f.portStr, lastErr)
 }
 
 // ChipType returns the detected chip type.
@@ -234,6 +262,11 @@ func (f *Flasher) connect() error {
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
+
+		// Sync failed — try reopening port (USB CDC may have re-enumerated)
+		if err := f.reopenPort(); err != nil {
+			continue // port reopen failed, try next attempt
+		}
 	}
 
 	return &SyncError{Attempts: attempts}
@@ -258,8 +291,20 @@ synced:
 
 	f.logf("Detected chip: %s", f.chip.Name)
 
+	// Run chip-specific post-connect initialization.
+	if f.chip.PostConnect != nil {
+		if err := f.chip.PostConnect(f); err != nil {
+			f.logf("Warning: post-connect: %v", err)
+		}
+	}
+
 	// Propagate chip capabilities to the connection layer.
 	f.conn.setSupportsEncryptedFlash(f.chip.SupportsEncryptedFlash)
+
+	// Propagate USB flag to connection layer for block size optimization.
+	if f.usesUSB {
+		f.conn.setUSB(true)
+	}
 
 	// Upload the stub loader to enable advanced features (erase, compression, etc.).
 	if s, ok := stubFor(f.chip.ChipType); ok {
@@ -717,6 +762,20 @@ func (f *Flasher) GetMD5(offset, size uint32) (string, error) {
 	return hex.EncodeToString(result), nil
 }
 
+// ReadFlash reads data from flash memory.
+// Requires the stub loader to be running.
+func (f *Flasher) ReadFlash(offset, size uint32) ([]byte, error) {
+	if !f.conn.isStub() {
+		return nil, &UnsupportedCommandError{Command: "read flash (requires stub)"}
+	}
+
+	if err := f.attachFlash(); err != nil {
+		return nil, err
+	}
+
+	return f.conn.readFlash(offset, size)
+}
+
 // Reset performs a hard reset of the device, causing it to run user code.
 func (f *Flasher) Reset() {
 	if f.conn.isStub() {
@@ -731,7 +790,7 @@ func (f *Flasher) Reset() {
 	// CMD_FLASH_BEGIN after a compressed download may interfere with
 	// the flash controller state at offset 0. esptool also just does
 	// a hard reset without any flash commands for the ROM path.
-	hardReset(f.port, false)
+	hardReset(f.port, f.usesUSB)
 	f.logf("Device reset.")
 }
 
