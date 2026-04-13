@@ -80,8 +80,8 @@ const (
 
 // conn wraps the serial port and provides the low-level protocol operations.
 type conn struct {
-	port   serial.Port
-	reader *slipReader
+	port    serial.Port
+	reader  *slipReader
 	stub    bool
 	usesUSB bool // set for USB-OTG and USB-JTAG/Serial connections
 	// supportsEncryptedFlash indicates the ROM supports the 5th parameter
@@ -137,13 +137,22 @@ func (c *conn) sendCommand(opcode byte, data []byte, chk uint32) error {
 	// USB CDC endpoints have limited buffer sizes. Writing large SLIP frames
 	// in one shot can overflow the endpoint buffer and cause data loss.
 	// Chunk writes to 64 bytes (standard USB Full Speed bulk endpoint size).
-	const maxChunk = 64
-	for off := 0; off < len(frame); off += maxChunk {
-		end := off + maxChunk
-		if end > len(frame) {
-			end = len(frame)
+	// Only use chunking for native USB connections (USB-OTG, USB-JTAG/Serial);
+	// UART bridge connections (CH340, CP2102 etc.) handle large writes fine
+	// and chunking just adds unnecessary syscall overhead.
+	if c.usesUSB {
+		const maxChunk = 64
+		for off := 0; off < len(frame); off += maxChunk {
+			end := off + maxChunk
+			if end > len(frame) {
+				end = len(frame)
+			}
+			if _, err := c.port.Write(frame[off:end]); err != nil {
+				return err
+			}
 		}
-		if _, err := c.port.Write(frame[off:end]); err != nil {
+	} else {
+		if _, err := c.port.Write(frame); err != nil {
 			return err
 		}
 	}
@@ -269,9 +278,14 @@ func (c *conn) sync() (uint32, error) {
 		return 0, err
 	}
 
-	// Read remaining sync responses (ROM sends up to 7 more)
+	// The ROM bootloader sends up to 7 additional sync responses after the
+	// first one. Drain them by reading frames directly (don't send new
+	// commands). Use a short timeout: the responses should already be in the
+	// serial buffer or arrive within a few milliseconds.
 	for range 7 {
-		c.command(0, nil, 0, syncTimeout, true) //nolint:errcheck
+		if _, err := c.reader.ReadFrame(50 * time.Millisecond); err != nil {
+			break // no more responses waiting — stop early
+		}
 	}
 
 	return resp.Value, nil

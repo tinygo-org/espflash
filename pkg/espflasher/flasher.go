@@ -203,6 +203,40 @@ func (f *Flasher) reopenPort() error {
 	return fmt.Errorf("reopen port %s: %w", f.portStr, lastErr)
 }
 
+// connectViaUSBJTAG performs a USB-JTAG/Serial reset and attempts to
+// reconnect. The reset causes the USB device to disconnect and
+// re-enumerate, so the old port is closed and a new one is opened.
+//
+// The reset sequence is run in a goroutine because ioctls on a
+// disconnected cdc_acm fd can block for several seconds on Linux.
+// After a short timeout we close the old port (which unblocks the
+// goroutine) and wait for the device to re-enumerate.
+func (f *Flasher) connectViaUSBJTAG() bool {
+	done := make(chan struct{})
+	go func() {
+		usbJTAGSerialReset(f.port)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		// Reset likely triggered but post-disconnect ioctls are blocking.
+		// reopenPort will close the fd, unblocking the goroutine.
+	}
+	if err := f.reopenPort(); err != nil {
+		return false
+	}
+	f.conn.flushInput()
+	for range 5 {
+		_, err := f.conn.sync()
+		if err == nil {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
 // ChipType returns the detected chip type.
 func (f *Flasher) ChipType() ChipType {
 	if f.chip != nil {
@@ -236,16 +270,22 @@ func (f *Flasher) connect() error {
 			if attempt%2 == 0 {
 				classicReset(f.port, defaultResetDelay)
 			} else {
-				tightReset(f.port, defaultResetDelay+500*time.Millisecond)
+				tightReset(f.port, defaultResetDelay)
 			}
 		case ResetUSBJTAG:
-			usbJTAGSerialReset(f.port)
+			if f.connectViaUSBJTAG() {
+				goto synced
+			}
+			continue
 		case ResetAuto:
 			switch attempt % 3 {
 			case 0:
 				classicReset(f.port, defaultResetDelay)
 			case 1:
-				usbJTAGSerialReset(f.port)
+				if f.connectViaUSBJTAG() {
+					goto synced
+				}
+				continue
 			case 2:
 				// No reset — device may already be in bootloader
 			}
@@ -263,9 +303,24 @@ func (f *Flasher) connect() error {
 			time.Sleep(50 * time.Millisecond)
 		}
 
-		// Sync failed — try reopening port (USB CDC may have re-enumerated)
+		// Sync failed — try reopening port (USB CDC may have re-enumerated
+		// after reset, causing the old port handle to be stale).
 		if err := f.reopenPort(); err != nil {
 			continue // port reopen failed, try next attempt
+		}
+
+		// Port reopened successfully — the device likely just finished
+		// USB re-enumeration after the reset above and the bootloader
+		// is already waiting for commands. Try to sync now before
+		// looping back and issuing another reset (which would disconnect
+		// USB all over again).
+		f.conn.flushInput()
+		for range 5 {
+			_, err := f.conn.sync()
+			if err == nil {
+				goto synced
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 
@@ -780,17 +835,33 @@ func (f *Flasher) ReadFlash(offset, size uint32) ([]byte, error) {
 func (f *Flasher) Reset() {
 	if f.conn.isStub() {
 		// The stub loader needs an explicit flash_begin/flash_end to
-		// cleanly exit flash mode before hardware reset.
+		// cleanly exit flash mode before hardware reset. Use reboot=false
+		// to keep the stub running so the port stays alive for hardReset.
 		f.conn.flashBegin(0, 0, false) //nolint:errcheck
-		f.conn.flashEnd(true)          //nolint:errcheck
+		f.conn.flashEnd(false)         //nolint:errcheck
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// For ROM bootloaders, skip flash_begin/flash_end — sending
-	// CMD_FLASH_BEGIN after a compressed download may interfere with
-	// the flash controller state at offset 0. esptool also just does
-	// a hard reset without any flash commands for the ROM path.
-	hardReset(f.port, f.usesUSB)
+	if f.usesUSB {
+		// On USB-JTAG/Serial, hardReset's SetRTS(true) pulls EN low while
+		// USB is still connected. During the 200ms sleep the chip resets
+		// and USB disconnects. The subsequent SetRTS(false) may block on
+		// the dead cdc_acm fd. Run in a goroutine and close the port
+		// after a timeout so the kernel releases the tty device node.
+		done := make(chan struct{})
+		go func() {
+			hardReset(f.port, true)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+		}
+		f.port.Close() //nolint:errcheck
+		<-done         // wait for goroutine to finish after fd closed
+	} else {
+		hardReset(f.port, false)
+	}
 	f.logf("Device reset.")
 }
 

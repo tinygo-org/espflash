@@ -624,7 +624,7 @@ func makeChangeBaudResponse() []byte {
 }
 
 func TestSendCommandChunking(t *testing.T) {
-	// Verify that sendCommand writes in chunks <= 64 bytes
+	// Verify that sendCommand writes in chunks <= 64 bytes for USB connections
 	var writes [][]byte
 	mock := &mockPort{
 		writeFunc: func(data []byte) (int, error) {
@@ -637,8 +637,9 @@ func TestSendCommandChunking(t *testing.T) {
 	}
 
 	c := &conn{
-		port:   mock,
-		reader: &slipReader{port: mock},
+		port:    mock,
+		reader:  &slipReader{port: mock},
+		usesUSB: true, // chunking only applies to USB connections
 	}
 
 	// Create test data that will result in a large SLIP frame

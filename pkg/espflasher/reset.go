@@ -2,6 +2,7 @@ package espflasher
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"go.bug.st/serial"
@@ -88,26 +89,39 @@ func tightReset(port serial.Port, delay time.Duration) {
 // usbJTAGSerialReset performs reset for USB-JTAG/Serial interfaces.
 // Used on ESP32-C3, ESP32-S3, ESP32-C6, ESP32-H2 when using the
 // built-in USB-JTAG/Serial peripheral.
+//
+// The sequence matches esptool's USBJTAGSerialReset: assert DTR (IO0=LOW
+// for bootloader), then toggle RTS through (1,1) to trigger reset, then
+// release. After SetRTS(true) the USB device may disconnect; subsequent
+// ioctls may block on Linux's cdc_acm driver, so callers should run this
+// in a goroutine with a timeout.
 func usbJTAGSerialReset(port serial.Port) {
 	port.SetRTS(false) //nolint:errcheck
-	port.SetDTR(false) //nolint:errcheck
+	port.SetDTR(false) //nolint:errcheck // Idle
 	time.Sleep(100 * time.Millisecond)
 
-	port.SetDTR(true)  //nolint:errcheck
+	port.SetDTR(true)  //nolint:errcheck // IO0=LOW (bootloader mode)
 	port.SetRTS(false) //nolint:errcheck
 	time.Sleep(100 * time.Millisecond)
 
-	port.SetRTS(true)  //nolint:errcheck
+	// Trigger reset. Go through (1,1) instead of (0,0).
+	// USB device may disconnect here.
+	port.SetRTS(true)  //nolint:errcheck // EN=LOW (reset)
 	port.SetDTR(false) //nolint:errcheck
-	port.SetRTS(true)  //nolint:errcheck
+	port.SetRTS(true)  //nolint:errcheck // Propagate DTR on RTS (Windows)
 	time.Sleep(100 * time.Millisecond)
-
-	port.SetRTS(false) //nolint:errcheck
 	port.SetDTR(false) //nolint:errcheck
+	port.SetRTS(false) //nolint:errcheck // EN=HIGH (chip out of reset)
 }
 
 // hardReset performs a hardware reset (chip restarts and runs user code).
 func hardReset(port serial.Port, usesUSB bool) {
+	if usesUSB {
+		// On USB-JTAG/Serial, the peripheral latches DTR (GPIO0 state)
+		// at reset time. Ensure DTR=false so GPIO0=HIGH → normal boot,
+		// not bootloader mode.
+		port.SetDTR(false) //nolint:errcheck
+	}
 	port.SetRTS(true) //nolint:errcheck
 	if usesUSB {
 		time.Sleep(200 * time.Millisecond)
@@ -117,6 +131,17 @@ func hardReset(port serial.Port, usesUSB bool) {
 		time.Sleep(100 * time.Millisecond)
 		port.SetRTS(false) //nolint:errcheck
 	}
+}
+
+// isNativeUSBPort returns true if the port path looks like a CDC ACM device
+// (native USB) rather than a USB-UART bridge. On native USB connections,
+// DTR/RTS ioctls after a chip reset will block because the USB device
+// disconnects, so a different reset strategy is needed.
+func isNativeUSBPort(portName string) bool {
+	// Linux: /dev/ttyACM*  (cdc_acm driver)
+	// macOS: /dev/cu.usbmodem*  (AppleUSBCDC driver)
+	return strings.Contains(portName, "ttyACM") ||
+		strings.Contains(portName, "usbmodem")
 }
 
 // String returns the string representation of the ResetMode.
