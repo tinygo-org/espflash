@@ -114,6 +114,61 @@ func main() {
 - **Configurable**: Customize baud rate, compression, reset mode, and more
 - **USB-JTAG/Serial**: Native USB support for boards like ESP32-S3 and ESP32-C3 that expose a built-in USB-JTAG/Serial interface (typically `/dev/ttyACM0` on Linux, `cu.usbmodem*` on macOS)
 - **Stubs**: Use stubs for higher-speed downloads and other advanced processor features
+- **NVS support**: Generate and parse ESP-IDF NVS (Non-Volatile Storage) partition images in pure Go
+
+## NVS Package
+
+The `nvs` package provides a pure-Go implementation for generating and parsing [ESP-IDF NVS (Non-Volatile Storage)](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/storage/nvs_flash.html) partition images in the v2 binary format.
+
+### Installation
+
+```bash
+go get tinygo.org/x/espflasher/pkg/nvs
+```
+
+### Generating an NVS Partition
+
+```go
+import "tinygo.org/x/espflasher/pkg/nvs"
+
+entries := []nvs.Entry{
+    {Namespace: "wifi", Key: "ssid", Type: "string", Value: "MyNetwork"},
+    {Namespace: "wifi", Key: "channel", Type: "u8", Value: uint8(6)},
+    {Namespace: "config", Key: "timeout", Type: "u16", Value: uint16(3000)},
+    {Namespace: "config", Key: "name", Type: "string", Value: "MyDevice"},
+}
+
+partition, err := nvs.GenerateNVS(entries, nvs.DefaultPartSize)
+if err != nil {
+    log.Fatal(err)
+}
+// partition is a []byte ready to flash at the NVS partition offset
+```
+
+### Parsing an NVS Partition
+
+```go
+entries, err := nvs.ParseNVS(partitionData)
+if err != nil {
+    log.Fatal(err)
+}
+for _, e := range entries {
+    fmt.Printf("[%s] %s = %v\n", e.Namespace, e.Key, e.Value)
+}
+```
+
+### Supported Value Types
+
+| Type | Go Value Type |
+|------|---------------|
+| `u8` | `uint8` (or `int`) |
+| `u16` | `uint16` (or `int`) |
+| `u32` | `uint32` (or `int`) |
+| `i8` | `int8` (or `int`) |
+| `i16` | `int16` (or `int`) |
+| `i32` | `int32` (or `int`) |
+| `string` | `string` |
+| `blob` | `[]byte` |
 
 ## Reset Modes
 
@@ -188,6 +243,7 @@ The library is organized in layers:
 | Chip | `pkg/espflasher/chip.go`, `pkg/espflasher/target_*.go` | Per-target definitions and detection |
 | Reset | `pkg/espflasher/reset.go` | Hardware reset strategies |
 | Flasher | `pkg/espflasher/flasher.go` | High-level flash/verify/reset API |
+| NVS | `pkg/nvs/*.go` | Generate and parse NVS partition images |
 | CLI | `main.go` | Command-line interface |
 
 ## Development
