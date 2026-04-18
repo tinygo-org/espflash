@@ -56,11 +56,11 @@ type chipDef struct {
 	Name string
 
 	// MagicValue is read from CHIP_DETECT_MAGIC_REG_ADDR on older chips.
-	// Only used for ESP8266 and ESP32 which don't support get_chip_id.
+	// Only used for ESP8266, ESP32, and ESP32-S2 which don't support get_chip_id.
 	MagicValue uint32
 
 	// ImageChipID is returned by the GET_SECURITY_INFO command on newer chips.
-	// ESP8266 and ESP32 use magic value detection instead (ImageChipID = 0).
+	// ESP8266, ESP32, and ESP32-S2 use magic value detection instead.
 	ImageChipID uint32
 
 	// UsesMagicValue indicates this chip uses the magic register for detection

@@ -9,6 +9,7 @@
 //   - ESP32-S3
 //   - ESP32-C2 (ESP8684)
 //   - ESP32-C3
+//   - ESP32-C5
 //   - ESP32-C6
 //   - ESP32-H2
 //
@@ -16,7 +17,7 @@
 //
 // To flash a .bin file to a connected ESP device:
 //
-//	flasher, err := espflasher.NewFlasher("/dev/ttyUSB0", nil)
+//	flasher, err := espflasher.New("/dev/ttyUSB0", nil)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
@@ -36,6 +37,8 @@
 //   - SLIP: Serial Line Internet Protocol framing (slip.go)
 //   - Protocol: ROM bootloader command/response protocol (protocol.go)
 //   - Chip: Per-target chip definitions and detection (chip.go, target_*.go)
+//   - Image: Firmware image header parsing and patching (image.go)
+//   - Stub: Stub loader for advanced operations like erase and read (stub.go)
 //   - Flasher: High-level flash/verify/reset API (flasher.go)
 //
 // The protocol uses SLIP framing over serial UART. Commands are sent as

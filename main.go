@@ -26,13 +26,13 @@ func main() {
 	port := flag.String("port", "", "Serial port (e.g. /dev/ttyUSB0, COM3)")
 	baud := flag.Int("baud", 460800, "Flash baud rate")
 	offset := flag.String("offset", "0x0", "Flash offset for single binary mode")
-	chip := flag.String("chip", "auto", "Chip type: auto, esp8266, esp32, esp32s2, esp32s3, esp32c2, esp32c3, esp32c6, esp32h2")
+	chip := flag.String("chip", "auto", "Chip type: auto, esp8266, esp32, esp32s2, esp32s3, esp32c2, esp32c3, esp32c5, esp32c6, esp32h2")
 	noCompress := flag.Bool("no-compress", false, "Disable compression")
 	eraseAll := flag.Bool("erase-all", false, "Erase entire flash before writing")
 	flashMode := flag.String("fm", "keep", "Flash mode: keep, qio, qout, dio, dout")
 	flashFreq := flag.String("ff", "keep", "Flash frequency: keep, 80m, 40m, 26m, 20m (chip-specific)")
 	flashSize := flag.String("fs", "keep", "Flash size: keep, 1MB, 2MB, 4MB, 8MB, 16MB")
-	resetMode := flag.String("reset", "default", "Reset mode: default, no-reset, usb-jtag")
+	resetMode := flag.String("reset", "default", "Reset mode: default, no-reset, usb-jtag, auto")
 	version := flag.Bool("version", false, "Print version and exit")
 
 	// Multi-image mode
@@ -104,6 +104,8 @@ func main() {
 		opts.ResetMode = espflasher.ResetNoReset
 	case "usb-jtag":
 		opts.ResetMode = espflasher.ResetUSBJTAG
+	case "auto":
+		opts.ResetMode = espflasher.ResetAuto
 	default:
 		log.Fatalf("Unknown reset mode: %s", *resetMode)
 	}
@@ -224,6 +226,8 @@ func parseChipType(s string) espflasher.ChipType {
 		return espflasher.ChipESP32C2
 	case "esp32c3", "esp32-c3":
 		return espflasher.ChipESP32C3
+	case "esp32c5", "esp32-c5":
+		return espflasher.ChipESP32C5
 	case "esp32c6", "esp32-c6":
 		return espflasher.ChipESP32C6
 	case "esp32h2", "esp32-h2":

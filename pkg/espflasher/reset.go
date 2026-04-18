@@ -86,7 +86,7 @@ func tightReset(port serial.Port, delay time.Duration) {
 }
 
 // usbJTAGSerialReset performs reset for USB-JTAG/Serial interfaces.
-// Used on ESP32-C3, ESP32-S3, ESP32-C6, ESP32-H2 when using the
+// Used on ESP32-C3, ESP32-S3, ESP32-C5, ESP32-C6, ESP32-H2 when using the
 // built-in USB-JTAG/Serial peripheral.
 //
 // The sequence matches esptool's USBJTAGSerialReset: assert DTR (IO0=LOW
