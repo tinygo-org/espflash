@@ -41,4 +41,4 @@
 // The protocol uses SLIP framing over serial UART. Commands are sent as
 // request packets with an opcode, and the device responds with status.
 // Flash writes can optionally use zlib-compressed data for faster transfers.
-package espflasher
+package espflasher // import "tinygo.org/x/espflasher/pkg/espflasher"
