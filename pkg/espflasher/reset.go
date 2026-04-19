@@ -29,11 +29,32 @@ const (
 
 const (
 	// defaultResetDelay is the standard delay during reset sequences.
-	defaultResetDelay = 100 * time.Millisecond
+	// Matches esptool.py's DEFAULT_RESET_DELAY.
+	defaultResetDelay = 50 * time.Millisecond
 
-	// tightResetDelay is a shorter delay for Unix systems.
-	tightResetDelay = 50 * time.Millisecond
+	// extraResetDelay is used for longer-duration reset cycles on some devices.
+	extraResetDelay = 550 * time.Millisecond
 )
+
+// setDTRandRTS sets DTR and RTS simultaneously.
+// On Unix systems (darwin, linux), uses atomic TIOCMSET ioctl to set both lines
+// in a single operation. This is important for CH340 boards that require precise
+// timing of the DTR/RTS transition.
+// On other systems, falls back to separate SetDTR and SetRTS calls.
+func setDTRandRTS(port serial.Port, dtr, rts bool) error {
+	// On Unix systems, try to use atomic TIOCMSET for precise timing
+	err := setDTRandRTSAtomic(port, dtr, rts)
+	if err == nil {
+		// Atomic operation succeeded
+		return nil
+	}
+
+	// Fallback: use separate calls (always used on non-Unix, used on Unix if atomic fails)
+	if err := port.SetDTR(dtr); err != nil {
+		return err
+	}
+	return port.SetRTS(rts)
+}
 
 // classicReset performs the classic DTR/RTS bootloader entry sequence.
 //
@@ -59,10 +80,36 @@ func classicReset(port serial.Port, delay time.Duration) {
 	// IO0=LOW (request bootloader), EN=HIGH (release reset)
 	port.SetDTR(true)  //nolint:errcheck
 	port.SetRTS(false) //nolint:errcheck
-	time.Sleep(tightResetDelay)
+	time.Sleep(defaultResetDelay)
 
 	// IO0=HIGH (release GPIO0)
 	port.SetDTR(false) //nolint:errcheck
+}
+
+// unixTightReset performs the esptool.py UnixTightReset sequence.
+// This uses atomic DTR/RTS transitions for precise timing on Unix systems.
+// It matches esptool.py's reset sequence to better support CH340 boards on macOS/Linux.
+//
+// Sequence (using atomic setDTRandRTS where possible):
+//  1. setDTRandRTS(false, false) - IO0=HIGH, EN=HIGH (idle)
+//  2. setDTRandRTS(true, true)   - IO0=LOW, EN=LOW
+//  3. setDTRandRTS(false, true)  - IO0=HIGH, EN=LOW (chip held in reset)
+//  4. Sleep 100ms
+//  5. setDTRandRTS(true, false)  - IO0=LOW, EN=HIGH (bootloader mode)
+//  6. Sleep delay ms
+//  7. setDTRandRTS(false, false) - IO0=HIGH, EN=HIGH
+//  8. SetDTR(false) - ensure IO0 is released
+func unixTightReset(port serial.Port, delay time.Duration) {
+	setDTRandRTS(port, false, false) //nolint:errcheck
+	setDTRandRTS(port, true, true)   //nolint:errcheck
+	setDTRandRTS(port, false, true)  //nolint:errcheck
+	time.Sleep(100 * time.Millisecond)
+
+	setDTRandRTS(port, true, false) //nolint:errcheck
+	time.Sleep(delay)
+
+	setDTRandRTS(port, false, false) //nolint:errcheck
+	port.SetDTR(false)               //nolint:errcheck
 }
 
 // tightReset performs a tighter reset timing variant.
@@ -80,7 +127,7 @@ func tightReset(port serial.Port, delay time.Duration) {
 	// Release: IO0=LOW (bootloader), EN=HIGH (run)
 	port.SetDTR(false) //nolint:errcheck
 	port.SetRTS(false) //nolint:errcheck
-	time.Sleep(tightResetDelay)
+	time.Sleep(defaultResetDelay)
 
 	port.SetDTR(false) //nolint:errcheck
 }
