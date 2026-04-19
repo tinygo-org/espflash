@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"runtime"
 	"time"
 
 	"go.bug.st/serial"
@@ -267,10 +268,26 @@ func (f *Flasher) connect() error {
 		// Reset the chip into bootloader mode
 		switch f.opts.ResetMode {
 		case ResetDefault:
-			if attempt%2 == 0 {
-				classicReset(f.port, defaultResetDelay)
+			// On Unix systems (darwin, linux), use the esptool sequence:
+			// unixTightReset with 50ms, then 550ms, then fallback to classic resets
+			if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+				switch attempt % 4 {
+				case 0:
+					unixTightReset(f.port, defaultResetDelay)
+				case 1:
+					unixTightReset(f.port, extraResetDelay)
+				case 2:
+					classicReset(f.port, defaultResetDelay)
+				case 3:
+					classicReset(f.port, extraResetDelay)
+				}
 			} else {
-				tightReset(f.port, defaultResetDelay)
+				// On other systems, use classic and tight reset alternation
+				if attempt%2 == 0 {
+					classicReset(f.port, defaultResetDelay)
+				} else {
+					tightReset(f.port, defaultResetDelay)
+				}
 			}
 		case ResetUSBJTAG:
 			if f.connectViaUSBJTAG() {
