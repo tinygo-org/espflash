@@ -630,9 +630,10 @@ func (c *conn) flashWriteSize() uint32 {
 	return flashWriteSizeROM
 }
 
-// flushInput discards any unread data from the serial port.
+// flushInput discards any unread data from the serial port and SLIP reader.
 func (c *conn) flushInput() {
 	c.port.ResetInputBuffer() //nolint:errcheck
+	c.reader.reset()
 }
 
 // eraseTimeoutForSize calculates an appropriate timeout for erase operations.

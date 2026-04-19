@@ -178,6 +178,12 @@ func (f *Flasher) Close() error {
 	return f.port.Close()
 }
 
+// FlushInput discards any unread data from the serial port and SLIP reader.
+// Useful when reusing a flasher connection across multiple operations.
+func (f *Flasher) FlushInput() {
+	f.conn.flushInput()
+}
+
 // reopenPort closes and reopens the serial port after a USB device
 // re-enumeration. TinyUSB CDC devices may briefly disappear during reset.
 func (f *Flasher) reopenPort() error {
@@ -799,9 +805,9 @@ func (f *Flasher) GetSecurityInfo() (*SecurityInfo, error) {
 	return f.readSecurityInfo()
 }
 
-// GetMD5 returns the MD5 hash of a flash region.
+// FlashMD5 returns the MD5 hash of a flash region.
 // Requires the stub loader to be running.
-func (f *Flasher) GetMD5(offset, size uint32) (string, error) {
+func (f *Flasher) FlashMD5(offset, size uint32) (string, error) {
 	if !f.conn.isStub() {
 		return "", &UnsupportedCommandError{Command: "flash MD5 (requires stub)"}
 	}
@@ -828,7 +834,12 @@ func (f *Flasher) ReadFlash(offset, size uint32) ([]byte, error) {
 		return nil, err
 	}
 
-	return f.conn.readFlash(offset, size)
+	data, err := f.conn.readFlash(offset, size)
+	// Clear any stale data left in the serial buffer and SLIP reader
+	// after the raw block-read protocol. Without this, leftover bytes
+	// can corrupt subsequent command responses.
+	f.conn.flushInput()
+	return data, err
 }
 
 // Reset performs a hard reset of the device, causing it to run user code.

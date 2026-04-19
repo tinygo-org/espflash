@@ -737,3 +737,45 @@ func TestReadFlashParameterValidation(t *testing.T) {
 		t.Errorf("cmdReadFlash opcode mismatch")
 	}
 }
+
+// flushTrackingPort embeds mockPort and records ResetInputBuffer calls.
+type flushTrackingPort struct {
+	mockPort
+	resetCount int
+}
+
+func (f *flushTrackingPort) ResetInputBuffer() error {
+	f.resetCount++
+	return nil
+}
+
+func TestConnFlushInputResetsPortAndReader(t *testing.T) {
+	port := &flushTrackingPort{}
+	c := newConn(port)
+	c.reader.leftover = []byte{0xDE, 0xAD, 0xBE, 0xEF}
+
+	c.flushInput()
+
+	if port.resetCount != 1 {
+		t.Errorf("ResetInputBuffer called %d times, want 1", port.resetCount)
+	}
+	if c.reader.leftover != nil {
+		t.Errorf("reader.leftover = %X after flushInput, want nil", c.reader.leftover)
+	}
+}
+
+func TestFlasherFlushInputDelegatesToConn(t *testing.T) {
+	port := &flushTrackingPort{}
+	c := newConn(port)
+	c.reader.leftover = []byte{0x01, 0x02}
+	f := &Flasher{conn: c}
+
+	f.FlushInput()
+
+	if port.resetCount != 1 {
+		t.Errorf("ResetInputBuffer called %d times, want 1", port.resetCount)
+	}
+	if c.reader.leftover != nil {
+		t.Errorf("reader.leftover not cleared by Flasher.FlushInput")
+	}
+}
