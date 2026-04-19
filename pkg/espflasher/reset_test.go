@@ -10,20 +10,29 @@ import (
 )
 
 // recordingPort tracks all calls to SetDTR and SetRTS for testing.
-// Each call is recorded as a separate event to allow testing the order and
-// combinations of line state transitions.
+// Separate dtrCalls/rtsCalls slices preserve the per-line value history;
+// the unified calls slice preserves the full cross-line ordering needed
+// by tests that assert on interleaving.
 type recordingPort struct {
 	dtrCalls []bool
 	rtsCalls []bool
+	calls    []lineCall
+}
+
+type lineCall struct {
+	line  string // "DTR" or "RTS"
+	value bool
 }
 
 func (r *recordingPort) SetDTR(dtr bool) error {
 	r.dtrCalls = append(r.dtrCalls, dtr)
+	r.calls = append(r.calls, lineCall{line: "DTR", value: dtr})
 	return nil
 }
 
 func (r *recordingPort) SetRTS(rts bool) error {
 	r.rtsCalls = append(r.rtsCalls, rts)
+	r.calls = append(r.calls, lineCall{line: "RTS", value: rts})
 	return nil
 }
 
@@ -35,9 +44,18 @@ func (r *recordingPort) SetWriteTimeout(t time.Duration) error                 {
 func (r *recordingPort) Close() error                                          { return nil }
 func (r *recordingPort) ResetInputBuffer() error                               { return nil }
 func (r *recordingPort) ResetOutputBuffer() error                              { return nil }
-func (r *recordingPort) GetModemStatusBits() (*serial.ModemStatusBits, error) { return nil, nil }
+func (r *recordingPort) GetModemStatusBits() (*serial.ModemStatusBits, error)  { return nil, nil }
 func (r *recordingPort) Break(t time.Duration) error                           { return nil }
 func (r *recordingPort) Drain() error                                          { return nil }
+
+func indexOf(calls []lineCall, line string, value bool, startAt int) int {
+	for i := startAt; i < len(calls); i++ {
+		if calls[i].line == line && calls[i].value == value {
+			return i
+		}
+	}
+	return -1
+}
 
 // TestClassicReset verifies the classic reset sequence.
 func TestClassicReset(t *testing.T) {
@@ -160,4 +178,37 @@ func TestResetDelayConstants(t *testing.T) {
 	// Verify constants match esptool expectations
 	assert.Equal(t, 50*time.Millisecond, defaultResetDelay, "defaultResetDelay should be 50ms")
 	assert.Equal(t, 550*time.Millisecond, extraResetDelay, "extraResetDelay should be 550ms")
+}
+
+// TestHardResetNonUSBReleasesDTRBeforeReleasingReset verifies that on the
+// non-USB path, hardReset deasserts DTR before releasing EN (RTS=false).
+// Otherwise a leftover DTR=true from a prior operation holds IO0 LOW when
+// EN goes HIGH and the chip re-enters the download-mode bootloader.
+func TestHardResetNonUSBReleasesDTRBeforeReleasingReset(t *testing.T) {
+	port := &recordingPort{}
+	hardReset(port, false)
+
+	rtsTrue := indexOf(port.calls, "RTS", true, 0)
+	require := assert.New(t)
+	require.GreaterOrEqual(rtsTrue, 0, "expected SetRTS(true) to pull EN LOW")
+
+	dtrFalse := indexOf(port.calls, "DTR", false, rtsTrue)
+	require.Greater(dtrFalse, rtsTrue, "SetDTR(false) must happen after EN is pulled LOW")
+
+	rtsFalseFinal := indexOf(port.calls, "RTS", false, dtrFalse)
+	require.Greater(rtsFalseFinal, dtrFalse,
+		"final SetRTS(false) (release reset) must happen after SetDTR(false) so IO0 is HIGH when EN goes HIGH")
+}
+
+// TestHardResetUSBDeassertsDTRFirst verifies that on the USB-JTAG path,
+// hardReset deasserts DTR before driving EN, so GPIO0 is HIGH (normal boot,
+// not bootloader) at the moment the USB-JTAG peripheral latches the reset.
+func TestHardResetUSBDeassertsDTRFirst(t *testing.T) {
+	port := &recordingPort{}
+	hardReset(port, true)
+
+	assert.NotEmpty(t, port.calls)
+	first := port.calls[0]
+	assert.Equal(t, "DTR", first.line, "first call must be SetDTR on USB path")
+	assert.False(t, first.value, "first SetDTR must be false (release GPIO0)")
 }

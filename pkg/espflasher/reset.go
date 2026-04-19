@@ -168,13 +168,18 @@ func hardReset(port serial.Port, usesUSB bool) {
 		// not bootloader mode.
 		port.SetDTR(false) //nolint:errcheck
 	}
-	port.SetRTS(true) //nolint:errcheck
+	port.SetRTS(true) //nolint:errcheck // EN=LOW (chip in reset)
 	if usesUSB {
 		time.Sleep(200 * time.Millisecond)
 		port.SetRTS(false) //nolint:errcheck
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		time.Sleep(100 * time.Millisecond)
+		// Release DTR before exiting reset. Otherwise a leftover DTR=true
+		// from a prior operation holds IO0 LOW at reset exit and the chip
+		// boots into the download-mode bootloader instead of the
+		// application. Matches esptool.py HardReset.
+		port.SetDTR(false) //nolint:errcheck
 		port.SetRTS(false) //nolint:errcheck
 	}
 }
