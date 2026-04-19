@@ -219,6 +219,29 @@ func TestFlasherChipName(t *testing.T) {
 	}
 }
 
+func TestFlasherBootloaderFlashOffset(t *testing.T) {
+	// ESP32: 0x1000
+	f := &Flasher{chip: defESP32, opts: DefaultOptions()}
+	off, ok := f.BootloaderFlashOffset()
+	if !ok || off != 0x1000 {
+		t.Errorf("ESP32 BootloaderFlashOffset() = (0x%X, %v), want (0x1000, true)", off, ok)
+	}
+
+	// ESP32-S3: 0x0
+	f2 := &Flasher{chip: defESP32S3, opts: DefaultOptions()}
+	off, ok = f2.BootloaderFlashOffset()
+	if !ok || off != 0x0 {
+		t.Errorf("ESP32-S3 BootloaderFlashOffset() = (0x%X, %v), want (0x0, true)", off, ok)
+	}
+
+	// Chip not detected yet: returns (0, false)
+	f3 := &Flasher{opts: DefaultOptions()}
+	off, ok = f3.BootloaderFlashOffset()
+	if ok || off != 0 {
+		t.Errorf("undetected BootloaderFlashOffset() = (0x%X, %v), want (0x0, false)", off, ok)
+	}
+}
+
 func TestFlashImagePatchesHeader(t *testing.T) {
 	// Verify that FlashImage calls patchImageHeader by checking that an
 	// invalid flash mode causes an error.

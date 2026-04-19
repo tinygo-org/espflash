@@ -260,6 +260,16 @@ func (f *Flasher) ChipName() string {
 	return "Unknown"
 }
 
+// BootloaderFlashOffset returns the flash offset where the bootloader image
+// lives for the connected chip. Returns (0, false) if the chip has not been
+// detected yet (e.g. connect() has not completed).
+func (f *Flasher) BootloaderFlashOffset() (uint32, bool) {
+	if f.chip == nil {
+		return 0, false
+	}
+	return f.chip.BootloaderFlashOffset, true
+}
+
 // connect performs the bootloader connection sequence:
 // reset → sync → detect chip.
 func (f *Flasher) connect() error {
