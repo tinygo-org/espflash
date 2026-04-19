@@ -25,6 +25,7 @@ var chips = []string{
 	"esp32c5",
 	"esp32c6",
 	"esp32h2",
+	"esp32p4-rev1",
 }
 
 func main() {

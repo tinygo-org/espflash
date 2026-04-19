@@ -15,6 +15,7 @@ const (
 	ChipESP32C5
 	ChipESP32C6
 	ChipESP32H2
+	ChipESP32P4Rev1
 	ChipAuto // Auto-detect chip type
 )
 
@@ -39,6 +40,8 @@ func (c ChipType) String() string {
 		return "ESP32-C6"
 	case ChipESP32H2:
 		return "ESP32-H2"
+	case ChipESP32P4Rev1:
+		return "ESP32-P4-Rev1"
 	case ChipAuto:
 		return "Auto"
 	default:
@@ -130,15 +133,16 @@ const chipDetectMagicRegAddr uint32 = 0x40001000
 
 // All known chip definitions.
 var chipDefs = map[ChipType]*chipDef{
-	ChipESP8266: defESP8266,
-	ChipESP32:   defESP32,
-	ChipESP32S2: defESP32S2,
-	ChipESP32S3: defESP32S3,
-	ChipESP32C2: defESP32C2,
-	ChipESP32C3: defESP32C3,
-	ChipESP32C5: defESP32C5,
-	ChipESP32C6: defESP32C6,
-	ChipESP32H2: defESP32H2,
+	ChipESP8266:     defESP8266,
+	ChipESP32:       defESP32,
+	ChipESP32S2:     defESP32S2,
+	ChipESP32S3:     defESP32S3,
+	ChipESP32C2:     defESP32C2,
+	ChipESP32C3:     defESP32C3,
+	ChipESP32C5:     defESP32C5,
+	ChipESP32C6:     defESP32C6,
+	ChipESP32H2:     defESP32H2,
+	ChipESP32P4Rev1: defESP32P4Rev1,
 }
 
 // detectChipByMagic returns the chip definition matching the given magic value,

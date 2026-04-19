@@ -13,15 +13,16 @@ var stubFS embed.FS
 
 // chipStubName maps each supported chip type to its stub JSON filename stem.
 var chipStubName = map[ChipType]string{
-	ChipESP8266: "esp8266",
-	ChipESP32:   "esp32",
-	ChipESP32S2: "esp32s2",
-	ChipESP32S3: "esp32s3",
-	ChipESP32C2: "esp32c2",
-	ChipESP32C3: "esp32c3",
-	ChipESP32C5: "esp32c5",
-	ChipESP32C6: "esp32c6",
-	ChipESP32H2: "esp32h2",
+	ChipESP8266:     "esp8266",
+	ChipESP32:       "esp32",
+	ChipESP32S2:     "esp32s2",
+	ChipESP32S3:     "esp32s3",
+	ChipESP32C2:     "esp32c2",
+	ChipESP32C3:     "esp32c3",
+	ChipESP32C5:     "esp32c5",
+	ChipESP32C6:     "esp32c6",
+	ChipESP32H2:     "esp32h2",
+	ChipESP32P4Rev1: "esp32p4-rev1",
 }
 
 // stubJSON mirrors the JSON structure of the esptool stub flasher files.
