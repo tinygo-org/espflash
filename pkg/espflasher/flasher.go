@@ -62,6 +62,11 @@ type FlasherOptions struct {
 	// Logger receives informational messages during flashing.
 	// If nil, messages are discarded silently.
 	Logger Logger
+
+	// SerialOpener, if non-nil, is used instead of serial.Open for all
+	// port opens (initial and reopen-after-USB-reenumeration). Useful for
+	// callers that multiplex port access across a monitor and the flasher.
+	SerialOpener func(name string, mode *serial.Mode) (serial.Port, error)
 }
 
 // Logger is the interface for receiving progress and status messages.
@@ -84,6 +89,14 @@ func DefaultOptions() *FlasherOptions {
 		ConnectAttempts: 7,
 		Compress:        true,
 	}
+}
+
+// openPort opens a serial port, using SerialOpener if available.
+func (opts *FlasherOptions) openPort(name string, mode *serial.Mode) (serial.Port, error) {
+	if opts != nil && opts.SerialOpener != nil {
+		return opts.SerialOpener(name, mode)
+	}
+	return serial.Open(name, mode)
 }
 
 // connection defines the low-level protocol operations for communicating
@@ -153,7 +166,7 @@ func New(portName string, opts *FlasherOptions) (*Flasher, error) {
 		StopBits: serial.OneStopBit,
 	}
 
-	port, err := serial.Open(portName, mode)
+	port, err := opts.openPort(portName, mode)
 	if err != nil {
 		return nil, fmt.Errorf("open serial port %s: %w", portName, err)
 	}
@@ -194,7 +207,7 @@ func (f *Flasher) reopenPort() error {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(500 * time.Millisecond)
-		port, err := serial.Open(f.portStr, &serial.Mode{
+		port, err := f.opts.openPort(f.portStr, &serial.Mode{
 			BaudRate: f.opts.BaudRate,
 			Parity:   serial.NoParity,
 			DataBits: 8,
