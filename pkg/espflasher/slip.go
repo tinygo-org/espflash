@@ -77,6 +77,11 @@ func newSlipReader(port serial.Port) *slipReader {
 	return &slipReader{port: port}
 }
 
+// reset clears any buffered data from the SLIP reader.
+func (r *slipReader) reset() {
+	r.leftover = nil
+}
+
 // ReadFrame reads a single SLIP-framed packet from the serial port.
 // It blocks until a complete frame is received or the timeout expires.
 func (r *slipReader) ReadFrame(timeout time.Duration) ([]byte, error) {

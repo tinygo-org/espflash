@@ -155,3 +155,23 @@ t.Errorf("raw 0xC0 found at inner byte %d in encoded data %X", i, encoded)
 }
 }
 }
+
+func TestSlipReaderResetClearsLeftover(t *testing.T) {
+	r := newSlipReader(nil)
+	r.leftover = []byte{0xDE, 0xAD, 0xBE, 0xEF}
+
+	r.reset()
+
+	if r.leftover != nil {
+		t.Errorf("leftover after reset = %X, want nil", r.leftover)
+	}
+}
+
+func TestSlipReaderResetIsIdempotent(t *testing.T) {
+	r := newSlipReader(nil)
+	r.reset()
+	r.reset()
+	if r.leftover != nil {
+		t.Errorf("leftover after double reset = %X, want nil", r.leftover)
+	}
+}
