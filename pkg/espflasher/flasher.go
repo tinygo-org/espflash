@@ -541,12 +541,20 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 		return fmt.Errorf("attach flash: %w", err)
 	}
 
-	// Auto-detect flash size when not explicitly set.
+	// Auto-detect flash size when not explicitly set, then re-push the SPI
+	// params so the stub knows the real chip size. Without the re-push, the
+	// stub keeps its default 4 MB bound from the initial attachFlash() and
+	// rejects any write past 4 MB with ESP_FAILED_SPI_OP (status 0xC4).
 	if f.opts.FlashSize == "" || f.opts.FlashSize == "keep" {
 		if detected := f.detectFlashSize(); detected != "" {
 			f.logf("Configuring flash size...")
 			f.logf("Auto-detected flash size: %s", detected)
 			f.opts.FlashSize = detected
+		}
+	}
+	if f.chip == nil || f.chip.ChipType != ChipESP8266 {
+		if err := f.configureSPIForSize(); err != nil {
+			return err
 		}
 	}
 
@@ -903,20 +911,55 @@ func (f *Flasher) attachFlash() error {
 		return err
 	}
 
-	// Configure flash parameters for common 4MB flash
-	// These defaults work for most development boards
+	return f.configureSPIForSize()
+}
+
+// configureSPIForSize tells the stub the flash chip's actual size derived
+// from f.opts.FlashSize. Without this, the stub keeps the default 4 MB
+// bound and rejects any write past 4 MB with ESP_FAILED_SPI_OP (status
+// 0xC4). Falls back to 4 MB when the size string is empty / "keep" /
+// unrecognised, matching the previous behaviour for the unconfigured case.
+func (f *Flasher) configureSPIForSize() error {
+	sizeBytes := uint32(4 * 1024 * 1024)
+	if b, ok := flashSizeStringToBytes(f.opts.FlashSize); ok {
+		sizeBytes = b
+	}
 	err := f.conn.spiSetParams(
-		4*1024*1024, // 4MB total
-		64*1024,     // 64KB block
-		4*1024,      // 4KB sector
-		256,         // 256B page
+		sizeBytes,
+		64*1024, // 64KB block
+		4*1024,  // 4KB sector
+		256,     // 256B page
 	)
 	if err != nil {
-		// Don't fail - some ROM versions don't support this
+		// Don't fail - some ROM versions don't support this.
 		f.logf("Warning: SPI params config failed (may be OK): %v", err)
 	}
-
 	return nil
+}
+
+// flashSizeStringToBytes converts a flash size string (e.g. "8MB") to the
+// chip capacity in bytes. Returns (0, false) for empty / "keep" / unknown
+// inputs so callers can apply a default.
+func flashSizeStringToBytes(s string) (uint32, bool) {
+	switch s {
+	case "1MB":
+		return 1 * 1024 * 1024, true
+	case "2MB":
+		return 2 * 1024 * 1024, true
+	case "4MB":
+		return 4 * 1024 * 1024, true
+	case "8MB":
+		return 8 * 1024 * 1024, true
+	case "16MB":
+		return 16 * 1024 * 1024, true
+	case "32MB":
+		return 32 * 1024 * 1024, true
+	case "64MB":
+		return 64 * 1024 * 1024, true
+	case "128MB":
+		return 128 * 1024 * 1024, true
+	}
+	return 0, false
 }
 
 // changeBaud switches to a higher baud rate for faster data transfer.
