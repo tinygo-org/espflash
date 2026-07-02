@@ -895,14 +895,22 @@ func (f *Flasher) Reset() {
 	if f.conn.isStub() {
 		// Tell the stub to cleanly exit flash mode and reboot.
 		// flashEnd(true) triggers a software reboot inside the stub.
+		// For ROM bootloaders, skip flash_begin/flash_end — sending
+		// CMD_FLASH_BEGIN after a compressed download may interfere with
+		// the flash controller state at offset 0.
 		f.conn.flashBegin(0, 0, false) //nolint:errcheck
 		f.conn.flashEnd(true)          //nolint:errcheck
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// For ROM bootloaders, skip flash_begin/flash_end — sending
-	// CMD_FLASH_BEGIN after a compressed download may interfere with
-	// the flash controller state at offset 0.
+	// Chips with a chip-specific hard reset (e.g. the ESP32-S2 USB-OTG
+	// watchdog reset) use it here; if it's unavailable or returns false,
+	// fall through to the DTR/RTS toggling below.
+	if f.chip != nil && f.chip.HardResetOTG != nil && f.chip.HardResetOTG(f) {
+		f.logf("Device reset.")
+		return
+	}
+
 	if f.usesUSB {
 		hardResetUSB(f.port)
 	} else {

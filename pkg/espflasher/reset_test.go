@@ -1,6 +1,7 @@
 package espflasher
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -211,4 +212,81 @@ func TestHardResetUSBDeassertsDTRFirst(t *testing.T) {
 	first := port.calls[0]
 	assert.Equal(t, "DTR", first.line, "first call must be SetDTR on USB path")
 	assert.False(t, first.value, "first SetDTR must be false (release GPIO0)")
+}
+
+// TestFlasherResetESP32S2UsesWatchdog verifies that Flasher.Reset() takes
+// the chip's HardResetOTG hook (RTC watchdog) for an ESP32-S2 flasher over
+// native USB-OTG, instead of the DTR/RTS hardResetUSB path used by chips
+// with a USB-Serial-JTAG bridge.
+func TestFlasherResetESP32S2UsesWatchdog(t *testing.T) {
+	port := &recordingPort{}
+	mc := &mockConnection{
+		readRegFunc: func(addr uint32) (uint32, error) {
+			return 0, nil // strap clear, force-download not set
+		},
+		writeRegFunc: func(addr, value, mask, delayUS uint32) error {
+			return nil
+		},
+	}
+	f := &Flasher{
+		conn:    mc,
+		port:    port,
+		opts:    &FlasherOptions{},
+		chip:    defESP32S2,
+		usesUSB: true,
+	}
+
+	f.Reset()
+
+	assert.Empty(t, port.calls, "watchdog reset path must not toggle DTR/RTS")
+}
+
+// TestFlasherResetESP32S2WatchdogWriteFailureFallsBack verifies that when a
+// watchdog register write fails, Flasher.Reset() falls back to the DTR/RTS
+// hardResetUSB path instead of treating the failed watchdog arm as a
+// successful reset.
+func TestFlasherResetESP32S2WatchdogWriteFailureFallsBack(t *testing.T) {
+	port := &recordingPort{}
+	mc := &mockConnection{
+		readRegFunc: func(addr uint32) (uint32, error) {
+			return 0, nil // strap clear, force-download not set
+		},
+		writeRegFunc: func(addr, value, mask, delayUS uint32) error {
+			if addr == esp32s2RTCCntlWDTConfig0 {
+				return errors.New("write failed")
+			}
+			return nil
+		},
+	}
+	f := &Flasher{
+		conn:    mc,
+		port:    port,
+		opts:    &FlasherOptions{},
+		chip:    defESP32S2,
+		usesUSB: true,
+	}
+
+	f.Reset()
+
+	assert.NotEmpty(t, port.calls, "watchdog write failure must fall back to DTR/RTS reset")
+}
+
+// TestFlasherResetUSBJTAGChipUnchanged verifies that chips using the
+// USB-Serial-JTAG bridge (no HardResetOTG hook, e.g. S3/C3/C6/H2/C5) still
+// take the existing DTR/RTS hardResetUSB path, unaffected by the S2
+// watchdog-reset addition.
+func TestFlasherResetUSBJTAGChipUnchanged(t *testing.T) {
+	port := &recordingPort{}
+	mc := &mockConnection{}
+	f := &Flasher{
+		conn:    mc,
+		port:    port,
+		opts:    &FlasherOptions{},
+		chip:    defESP32S3,
+		usesUSB: true,
+	}
+
+	f.Reset()
+
+	assert.NotEmpty(t, port.calls, "USB-Serial-JTAG chips must still use the DTR/RTS reset path")
 }
