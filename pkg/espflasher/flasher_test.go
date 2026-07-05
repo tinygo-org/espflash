@@ -428,6 +428,35 @@ func TestDetectChipReadRegError(t *testing.T) {
 	}
 }
 
+func TestDetectChipNilSecurityInfoAndReadRegError(t *testing.T) {
+	// E1-14 regression: when readSecurityInfo() itself fails (si == nil)
+	// AND the readReg(magic) fallback also fails, detectChip must not
+	// dereference si and must still fall back to the ESP32-S2 default.
+	mc := &mockConnection{
+		securityInfoFunc: func() ([]byte, error) {
+			return nil, errors.New("security info command not acked")
+		},
+		readRegFunc: func(addr uint32) (uint32, error) {
+			return 0, errors.New("serial port disconnected")
+		},
+	}
+	f := &Flasher{
+		opts: DefaultOptions(),
+		conn: mc,
+	}
+
+	def, err := f.detectChip()
+	if err != nil {
+		t.Fatalf("detectChip() should not error (falls back to ESP32-S2), got: %v", err)
+	}
+	if def.ChipType != ChipESP32S2 {
+		t.Errorf("detectChip() = %v, want ChipESP32S2 (fallback)", def.ChipType)
+	}
+	if def.SecureDownloadMode {
+		t.Errorf("SecureDownloadMode = true, want false when security info was unavailable")
+	}
+}
+
 func TestFlashSizeFromJEDECMatchesChipSizes(t *testing.T) {
 	// Verify that all JEDEC-detected sizes are present in at least one chip's
 	// FlashSizes map.

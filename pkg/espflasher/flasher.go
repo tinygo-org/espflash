@@ -178,12 +178,22 @@ func New(portName string, opts *FlasherOptions) (*Flasher, error) {
 		portStr: portName,
 	}
 
+	// Ensure the port is closed on any non-success return from here on,
+	// including a panic unwinding through f.connect(). succeeded is only
+	// set true right before the final successful return.
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			f.port.Close() //nolint:errcheck
+		}
+	}()
+
 	// Connect to the bootloader
 	if err := f.connect(); err != nil {
-		f.port.Close() //nolint:errcheck
 		return nil, err
 	}
 
+	succeeded = true
 	return f, nil
 }
 
@@ -445,7 +455,15 @@ func (f *Flasher) detectChip() (*chipDef, error) {
 		// and supports secure download mode
 		f.logf("unable to read chip magic value. Defaulting to ESP32-S2: %s", err)
 
-		chipDefs[ChipESP32S2].SecureDownloadMode = si.ParsedFlags.SecureDownloadEnable
+		// si may be nil here if readSecurityInfo also failed above; default
+		// SecureDownloadMode to false in that case rather than dereferencing.
+		// Note: chipDefs[ChipESP32S2] is a shared package-level global being
+		// mutated in place here (pre-existing behavior, not changed by this fix).
+		secureDownload := false
+		if si != nil {
+			secureDownload = si.ParsedFlags.SecureDownloadEnable
+		}
+		chipDefs[ChipESP32S2].SecureDownloadMode = secureDownload
 		return chipDefs[ChipESP32S2], nil
 	}
 

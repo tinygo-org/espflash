@@ -391,8 +391,10 @@ func TestCommandOpcodes(t *testing.T) {
 
 // mockPort implements serial.Port for testing.
 type mockPort struct {
-	writeFunc func([]byte) (int, error)
-	readFunc  func([]byte) (int, error)
+	writeFunc  func([]byte) (int, error)
+	readFunc   func([]byte) (int, error)
+	closeFunc  func() error
+	closeCalls int
 }
 
 func (m *mockPort) Write(p []byte) (int, error) {
@@ -409,10 +411,16 @@ func (m *mockPort) Read(p []byte) (int, error) {
 	return 0, nil
 }
 
-func (m *mockPort) SetMode(mode *serial.Mode) error                      { return nil }
-func (m *mockPort) SetReadTimeout(t time.Duration) error                 { return nil }
-func (m *mockPort) SetWriteTimeout(t time.Duration) error                { return nil }
-func (m *mockPort) Close() error                                         { return nil }
+func (m *mockPort) SetMode(mode *serial.Mode) error       { return nil }
+func (m *mockPort) SetReadTimeout(t time.Duration) error  { return nil }
+func (m *mockPort) SetWriteTimeout(t time.Duration) error { return nil }
+func (m *mockPort) Close() error {
+	m.closeCalls++
+	if m.closeFunc != nil {
+		return m.closeFunc()
+	}
+	return nil
+}
 func (m *mockPort) ResetInputBuffer() error                              { return nil }
 func (m *mockPort) ResetOutputBuffer() error                             { return nil }
 func (m *mockPort) SetDTR(dtr bool) error                                { return nil }
