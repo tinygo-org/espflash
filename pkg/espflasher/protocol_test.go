@@ -108,6 +108,41 @@ func TestEraseTimeoutForSize(t *testing.T) {
 	}
 }
 
+func TestFlashWriteTimeoutForSize(t *testing.T) {
+	// E1-15 regression: compressed flash write/finish acks must scale by
+	// size (mirroring eraseTimeoutForSize), with a floor of defaultTimeout
+	// so small blocks aren't over-inflated.
+	tests := []struct {
+		name string
+		size uint32
+		min  time.Duration
+	}{
+		{"zero size has floor", 0, defaultTimeout},
+		{"small 4KB block has floor", 4096, defaultTimeout},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeout := flashWriteTimeoutForSize(tt.size)
+			if timeout < tt.min {
+				t.Errorf("flashWriteTimeoutForSize(%d) = %v, want >= %v", tt.size, timeout, tt.min)
+			}
+		})
+	}
+
+	// A 4MB compressed write must get a materially larger timeout than a
+	// 4KB block, so large transfers over slow USB-serial bridges don't
+	// time out on a flat ack wait.
+	small := flashWriteTimeoutForSize(4 * 1024)
+	large := flashWriteTimeoutForSize(4 * 1024 * 1024)
+	if large <= small {
+		t.Errorf("expected larger timeout for bigger size: small(4KB)=%v large(4MB)=%v", small, large)
+	}
+	if large < 2*small {
+		t.Errorf("expected 4MB timeout to be materially larger than 4KB timeout: small=%v large=%v", small, large)
+	}
+}
+
 func TestSendCommandFormat(t *testing.T) {
 	// Test that sendCommand builds the correct packet structure using a mock port.
 	var written []byte

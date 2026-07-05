@@ -88,6 +88,9 @@ type conn struct {
 	// (encrypted flag) in flash_begin/flash_defl_begin commands.
 	// Set based on chip type after detection.
 	supportsEncryptedFlash bool
+	// deflCompSize is the compressed size passed to the most recent
+	// flashDeflBegin call, used to scale the flashDeflEnd ack timeout.
+	deflCompSize uint32
 }
 
 // isStub returns whether the stub loader is running.
@@ -451,6 +454,10 @@ func (c *conn) flashDeflBegin(uncompSize, compSize, offset uint32, encrypted boo
 
 	timeout := eraseTimeoutForSize(uncompSize)
 
+	// Remember the compressed size for this download so flashDeflEnd can
+	// scale its own ack timeout the same way.
+	c.deflCompSize = compSize
+
 	// ESP32-S2 and newer ROM bootloaders support a 5th parameter (encrypted
 	// flag). ESP8266 and original ESP32 ROM only accept 4 parameters (16 bytes).
 	paramLen := 16
@@ -479,7 +486,8 @@ func (c *conn) flashDeflData(block []byte, seq uint32) error {
 	binary.LittleEndian.PutUint32(data[12:16], 0)
 	copy(data[16:], block)
 
-	_, err := c.checkCommand("write compressed flash block", cmdFlashDeflData, data, checksum(block), defaultTimeout, 0)
+	timeout := flashWriteTimeoutForSize(uint32(len(block)))
+	_, err := c.checkCommand("write compressed flash block", cmdFlashDeflData, data, checksum(block), timeout, 0)
 	return err
 }
 
@@ -490,7 +498,8 @@ func (c *conn) flashDeflEnd(reboot bool) error {
 		binary.LittleEndian.PutUint32(data, 1)
 	}
 
-	_, err := c.checkCommand("finish compressed flash download", cmdFlashDeflEnd, data, 0, defaultTimeout, 0)
+	timeout := flashWriteTimeoutForSize(c.deflCompSize)
+	_, err := c.checkCommand("finish compressed flash download", cmdFlashDeflEnd, data, 0, timeout, 0)
 	return err
 }
 
@@ -642,6 +651,20 @@ func eraseTimeoutForSize(size uint32) time.Duration {
 	t := defaultTimeout + time.Duration(float64(eraseWritePerMBRate)*float64(size)/float64(1024*1024))
 	if t < 10*time.Second {
 		t = 10 * time.Second
+	}
+	return t
+}
+
+// flashWriteTimeoutForSize calculates an appropriate ack timeout for
+// compressed flash write/finish commands, scaled by data size using the
+// same per-MB rate as eraseTimeoutForSize. Unlike erase (which floors at
+// 10s for a whole-region operation), write/finish acks are per-block or
+// per-image and use the smaller defaultTimeout floor so small writes
+// aren't over-inflated.
+func flashWriteTimeoutForSize(size uint32) time.Duration {
+	t := defaultTimeout + time.Duration(float64(eraseWritePerMBRate)*float64(size)/float64(1024*1024))
+	if t < defaultTimeout {
+		t = defaultTimeout
 	}
 	return t
 }
