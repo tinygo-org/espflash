@@ -578,7 +578,9 @@ func (c *conn) eraseRegion(offset, size uint32) error {
 }
 
 // readFlash reads data from flash memory (stub-only).
-func (c *conn) readFlash(offset, size uint32) ([]byte, error) {
+// If progress is non-nil, it is called after each block is appended with the
+// cumulative bytes read so far; the final call reports (size, size).
+func (c *conn) readFlash(offset, size uint32, progress ProgressFunc) ([]byte, error) {
 	data := make([]byte, 16)
 	binary.LittleEndian.PutUint32(data[0:4], offset)
 	binary.LittleEndian.PutUint32(data[4:8], size)
@@ -600,6 +602,17 @@ func (c *conn) readFlash(offset, size uint32) ([]byte, error) {
 			return nil, fmt.Errorf("read flash block %d/%d: %w", i+1, numBlocks, err)
 		}
 		result = append(result, block...)
+
+		if progress != nil {
+			// The final block may over-read past size (trimmed below); clamp
+			// the reported current so the sequence stays monotonic and the
+			// last call is exactly (size, size).
+			current := len(result)
+			if current > int(size) {
+				current = int(size)
+			}
+			progress(current, int(size))
+		}
 
 		// Send ACK: cumulative bytes received (SLIP-framed)
 		ack := make([]byte, 4)

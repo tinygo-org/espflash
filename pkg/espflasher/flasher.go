@@ -76,9 +76,11 @@ type Logger interface {
 }
 
 // ProgressFunc is called with progress updates during long-running
-// operations. The meaning of current and total is operation-defined:
-// bytes transferred / total for flashing; elapsed / estimated milliseconds
-// for erase.
+// operations. The meaning of current and total is operation-defined: for
+// flashing and reading, they are bytes transferred and total bytes; for
+// erase, they are elapsed and estimated-total milliseconds, since erase is
+// a single blocking command with no per-chunk protocol seam to report exact
+// byte progress.
 type ProgressFunc func(current, total int)
 
 // DefaultOptions returns FlasherOptions with sensible defaults.
@@ -121,7 +123,7 @@ type connection interface {
 	changeBaud(newBaud, oldBaud uint32) error
 	eraseFlash() error
 	eraseRegion(offset, size uint32) error
-	readFlash(offset, size uint32) ([]byte, error)
+	readFlash(offset, size uint32, progress ProgressFunc) ([]byte, error)
 	flushInput()
 	isStub() bool
 	setUSB(v bool)
@@ -957,7 +959,10 @@ func (f *Flasher) GetFlashMD5(offset, size uint32) (string, error) {
 
 // ReadFlash reads data from flash memory.
 // Requires the stub loader to be running.
-func (f *Flasher) ReadFlash(offset, size uint32) ([]byte, error) {
+// If progress is non-nil, it is called after each block is read with the
+// cumulative bytes read so far; the final call reports (size, size).
+// If size is 0, the read returns immediately with no progress callback invoked.
+func (f *Flasher) ReadFlash(offset, size uint32, progress ProgressFunc) ([]byte, error) {
 	if !f.conn.isStub() {
 		return nil, &UnsupportedCommandError{Command: "read flash (requires stub)"}
 	}
@@ -966,7 +971,7 @@ func (f *Flasher) ReadFlash(offset, size uint32) ([]byte, error) {
 		return nil, err
 	}
 
-	data, err := f.conn.readFlash(offset, size)
+	data, err := f.conn.readFlash(offset, size, progress)
 	// Clear any stale data left in the serial buffer and SLIP reader
 	// after the raw block-read protocol. Without this, leftover bytes
 	// can corrupt subsequent command responses.

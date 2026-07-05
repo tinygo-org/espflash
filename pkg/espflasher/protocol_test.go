@@ -1,6 +1,7 @@
 package espflasher
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 	"time"
@@ -442,7 +443,7 @@ type mockConnection struct {
 	eraseRegionFunc             func(offset, size uint32) error
 	flushInputFunc              func()
 	loadStubFunc                func(s *stub) error
-	readFlashFunc               func(offset, size uint32) ([]byte, error)
+	readFlashFunc               func(offset, size uint32, progress ProgressFunc) ([]byte, error)
 	stubMode                    bool
 	usbMode                     bool
 	supportsEncryptedFlashValue bool
@@ -573,9 +574,9 @@ func (m *mockConnection) flushInput() {
 	}
 }
 
-func (m *mockConnection) readFlash(offset, size uint32) ([]byte, error) {
+func (m *mockConnection) readFlash(offset, size uint32, progress ProgressFunc) ([]byte, error) {
 	if m.readFlashFunc != nil {
-		return m.readFlashFunc(offset, size)
+		return m.readFlashFunc(offset, size, progress)
 	}
 	return nil, nil
 }
@@ -735,6 +736,164 @@ func TestReadFlashParameterValidation(t *testing.T) {
 	}
 	if cmdReadFlash != 0xD2 {
 		t.Errorf("cmdReadFlash opcode mismatch")
+	}
+}
+
+// makeReadFlashCommandResponse creates a mock response for the read flash
+// command that kicks off the block-read loop.
+func makeReadFlashCommandResponse() []byte {
+	resp := make([]byte, 10)
+	resp[0] = respDirectionResp
+	resp[1] = cmdReadFlash
+	binary.LittleEndian.PutUint16(resp[2:4], 2) // data len = 2
+	binary.LittleEndian.PutUint32(resp[4:8], 0) // value
+	resp[8] = 0x00                              // status OK
+	resp[9] = 0x00                              // error 0
+	return resp
+}
+
+// newReadFlashMockPort builds a mockPort whose Read stream replays the
+// command ack, followed by the given raw data blocks (each SLIP-framed as
+// the device would send them), followed by the trailing 16-byte MD5 digest.
+func newReadFlashMockPort(blocks [][]byte) *mockPort {
+	var stream []byte
+	stream = append(stream, slipEncode(makeReadFlashCommandResponse())...)
+	for _, block := range blocks {
+		stream = append(stream, slipEncode(block)...)
+	}
+	stream = append(stream, slipEncode(make([]byte, 16))...) // MD5 digest
+
+	reader := bytes.NewReader(stream)
+	return &mockPort{readFunc: reader.Read}
+}
+
+func TestReadFlashProgressCallback(t *testing.T) {
+	// Span 2 blocks: a full 4KB block plus a partial 500-byte remainder.
+	// The mock device returns a full block for both (as real hardware does),
+	// so readFlash must trim the over-read on the final block.
+	const size = readFlashBlockSize + 500
+
+	block1 := bytes.Repeat([]byte{0xAA}, int(readFlashBlockSize))
+	block2 := bytes.Repeat([]byte{0xBB}, int(readFlashBlockSize))
+
+	mock := newReadFlashMockPort([][]byte{block1, block2})
+	c := &conn{port: mock, reader: newSlipReader(mock)}
+
+	type progressCall struct{ current, total int }
+	var calls []progressCall
+	progress := func(current, total int) {
+		calls = append(calls, progressCall{current, total})
+	}
+
+	data, err := c.readFlash(0, size, progress)
+	if err != nil {
+		t.Fatalf("readFlash failed: %v", err)
+	}
+	if len(data) != int(size) {
+		t.Fatalf("len(data) = %d, want %d", len(data), size)
+	}
+
+	if len(calls) < 2 {
+		t.Fatalf("expected >= 2 progress calls, got %d", len(calls))
+	}
+
+	prev := 0
+	for i, call := range calls {
+		if call.total != int(size) {
+			t.Errorf("call[%d].total = %d, want %d", i, call.total, size)
+		}
+		if call.current > int(size) {
+			t.Errorf("call[%d].current = %d, want <= %d", i, call.current, size)
+		}
+		if call.current < prev {
+			t.Errorf("call[%d].current = %d, not monotonic (prev %d)", i, call.current, prev)
+		}
+		prev = call.current
+	}
+
+	last := calls[len(calls)-1]
+	if last.current != int(size) || last.total != int(size) {
+		t.Errorf("final call = (%d, %d), want (%d, %d)", last.current, last.total, size, size)
+	}
+}
+
+func TestReadFlashProgressExactBlockMultiple(t *testing.T) {
+	// size is an exact multiple of readFlashBlockSize, so every block is
+	// full-sized and no trimming of the final block is needed.
+	const size = 2 * readFlashBlockSize
+
+	block1 := bytes.Repeat([]byte{0xAA}, int(readFlashBlockSize))
+	block2 := bytes.Repeat([]byte{0xBB}, int(readFlashBlockSize))
+
+	mock := newReadFlashMockPort([][]byte{block1, block2})
+	c := &conn{port: mock, reader: newSlipReader(mock)}
+
+	type progressCall struct{ current, total int }
+	var calls []progressCall
+	progress := func(current, total int) {
+		calls = append(calls, progressCall{current, total})
+	}
+
+	data, err := c.readFlash(0, size, progress)
+	if err != nil {
+		t.Fatalf("readFlash failed: %v", err)
+	}
+	if len(data) != int(size) {
+		t.Fatalf("len(data) = %d, want %d", len(data), size)
+	}
+
+	if len(calls) < 2 {
+		t.Fatalf("expected >= 2 progress calls, got %d", len(calls))
+	}
+
+	prev := 0
+	for i, call := range calls {
+		if call.current < prev {
+			t.Errorf("call[%d].current = %d, not monotonic (prev %d)", i, call.current, prev)
+		}
+		prev = call.current
+	}
+
+	last := calls[len(calls)-1]
+	if last.current != int(size) || last.total != int(size) {
+		t.Errorf("final call = (%d, %d), want (%d, %d)", last.current, last.total, size, size)
+	}
+}
+
+func TestReadFlashProgressZeroSize(t *testing.T) {
+	mock := newReadFlashMockPort(nil)
+	c := &conn{port: mock, reader: newSlipReader(mock)}
+
+	called := false
+	progress := func(current, total int) {
+		called = true
+	}
+
+	data, err := c.readFlash(0, 0, progress)
+	if err != nil {
+		t.Fatalf("readFlash failed: %v", err)
+	}
+	if len(data) != 0 {
+		t.Fatalf("len(data) = %d, want 0", len(data))
+	}
+	if called {
+		t.Errorf("progress callback invoked for size == 0, want no calls")
+	}
+}
+
+func TestReadFlashNilProgressNoPanic(t *testing.T) {
+	const size = 100
+	block := bytes.Repeat([]byte{0xCC}, int(size))
+
+	mock := newReadFlashMockPort([][]byte{block})
+	c := &conn{port: mock, reader: newSlipReader(mock)}
+
+	data, err := c.readFlash(0, size, nil)
+	if err != nil {
+		t.Fatalf("readFlash with nil progress failed: %v", err)
+	}
+	if len(data) != int(size) {
+		t.Fatalf("len(data) = %d, want %d", len(data), size)
 	}
 }
 
