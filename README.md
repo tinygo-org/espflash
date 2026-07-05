@@ -220,10 +220,15 @@ err := flasher.FlashImages(images, progressCallback)
 
 ```go
 // Erase entire flash
-err := flasher.EraseFlash()
+err := flasher.EraseFlash(nil)
 
 // Erase a specific region (must be sector-aligned)
-err := flasher.EraseRegion(0x10000, 0x100000)
+err := flasher.EraseRegion(0x10000, 0x100000, nil)
+
+// Erase with progress: current/total are elapsed/estimated milliseconds
+err := flasher.EraseFlash(func(current, total int) {
+	fmt.Printf("erasing... %dms / %dms\n", current, total)
+})
 
 // Read a hardware register
 val, err := flasher.ReadRegister(0x3FF00050)

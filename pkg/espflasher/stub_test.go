@@ -88,7 +88,7 @@ func TestEraseFlashRequiresStub(t *testing.T) {
 	mc := &mockConnection{stubMode: false}
 	f := &Flasher{conn: mc, opts: DefaultOptions()}
 
-	err := f.EraseFlash()
+	err := f.EraseFlash(nil)
 	if err == nil {
 		t.Error("EraseFlash should fail without stub")
 	}
@@ -109,7 +109,7 @@ func TestEraseFlashSucceedsWithStub(t *testing.T) {
 	}
 	f := &Flasher{conn: mc, opts: DefaultOptions()}
 
-	if err := f.EraseFlash(); err != nil {
+	if err := f.EraseFlash(nil); err != nil {
 		t.Fatalf("EraseFlash returned error: %v", err)
 	}
 	if !called {

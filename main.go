@@ -123,7 +123,7 @@ func main() {
 	fmt.Printf("Chip: %s\n", flasher.ChipName())
 
 	if *eraseAll {
-		if err := flasher.EraseFlash(); err != nil {
+		if err := flasher.EraseFlash(nil); err != nil {
 			log.Fatalf("Erase failed: %v", err)
 		}
 	}

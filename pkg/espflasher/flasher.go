@@ -75,8 +75,10 @@ type Logger interface {
 	Logf(format string, args ...interface{})
 }
 
-// ProgressFunc is called with progress updates during flashing.
-// current is the bytes transferred so far, total is the total bytes.
+// ProgressFunc is called with progress updates during long-running
+// operations. The meaning of current and total is operation-defined:
+// bytes transferred / total for flashing; elapsed / estimated milliseconds
+// for erase.
 type ProgressFunc func(current, total int)
 
 // DefaultOptions returns FlasherOptions with sensible defaults.
@@ -806,13 +808,26 @@ func (f *Flasher) verifyMD5(data []byte, offset uint32) error {
 // EraseFlash erases the entire flash memory.
 // This operation can take a significant amount of time (30-120 seconds).
 // Requires the stub loader to be running.
-func (f *Flasher) EraseFlash() error {
+//
+// If progress is non-nil, it is called periodically with a synthetic ETA
+// (elapsed and estimated milliseconds) ticked against the erase timeout,
+// since the device stays silent for the duration of the erase and reports
+// no real completion percentage. Pass nil to skip this entirely.
+func (f *Flasher) EraseFlash(progress ProgressFunc) error {
 	if !f.conn.isStub() {
 		return &UnsupportedCommandError{Command: "erase flash (requires stub)"}
 	}
 
 	f.logf("Erasing entire flash...")
-	if err := f.conn.eraseFlash(); err != nil {
+	if progress == nil {
+		if err := f.conn.eraseFlash(); err != nil {
+			return err
+		}
+		f.logf("Flash erased.")
+		return nil
+	}
+
+	if err := tickErase(chipEraseTimeout, eraseProgressInterval, progress, f.conn.eraseFlash); err != nil {
 		return err
 	}
 	f.logf("Flash erased.")
@@ -822,7 +837,12 @@ func (f *Flasher) EraseFlash() error {
 // EraseRegion erases a region of flash memory.
 // Requires the stub loader to be running.
 // Both offset and size must be aligned to the flash sector size (4096 bytes).
-func (f *Flasher) EraseRegion(offset, size uint32) error {
+//
+// If progress is non-nil, it is called periodically with a synthetic ETA
+// (elapsed and estimated milliseconds) ticked against the erase timeout,
+// since the device stays silent for the duration of the erase and reports
+// no real completion percentage. Pass nil to skip this entirely.
+func (f *Flasher) EraseRegion(offset, size uint32, progress ProgressFunc) error {
 	if !f.conn.isStub() {
 		return &UnsupportedCommandError{Command: "erase region (requires stub)"}
 	}
@@ -835,7 +855,71 @@ func (f *Flasher) EraseRegion(offset, size uint32) error {
 	}
 
 	f.logf("Erasing %d bytes at 0x%08X...", size, offset)
-	return f.conn.eraseRegion(offset, size)
+	if progress == nil {
+		return f.conn.eraseRegion(offset, size)
+	}
+
+	return tickErase(eraseTimeoutForSize(size), eraseProgressInterval, progress, func() error {
+		return f.conn.eraseRegion(offset, size)
+	})
+}
+
+// eraseProgressInterval is the tick interval used by tickErase when reporting
+// synthetic erase progress via EraseFlash and EraseRegion.
+const eraseProgressInterval = 500 * time.Millisecond
+
+// tickErase runs work (a blocking erase call) while emitting synthetic ETA
+// progress updates against est every interval, until work returns. progress
+// is called with (elapsedMs, estMs), capped so elapsed never reaches est
+// until work has actually completed successfully. On success, a final
+// progress(estMs, estMs) call is emitted; on error, no such call is made.
+//
+// The ticker goroutine only ever calls progress — it never touches the
+// connection — and is always stopped and joined before tickErase returns,
+// via a deferred cleanup registered before work is invoked. This holds even
+// if work panics: the deferred cleanup still runs during unwinding, the
+// ticker goroutine is joined, and the panic is left to propagate afterward
+// without emitting a bogus final progress(estMs, estMs) call.
+func tickErase(est, interval time.Duration, progress ProgressFunc, work func() error) error {
+	estMs := int(est / time.Millisecond)
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		start := time.Now()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				elapsedMs := int(time.Since(start) / time.Millisecond)
+				if elapsedMs >= estMs {
+					elapsedMs = estMs - 1
+				}
+				progress(elapsedMs, estMs)
+			}
+		}
+	}()
+
+	var success bool
+	defer func() {
+		close(done)
+		<-stopped
+		if success {
+			progress(estMs, estMs)
+		}
+	}()
+
+	if err := work(); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }
 
 // ReadRegister reads a 32-bit register from the device.

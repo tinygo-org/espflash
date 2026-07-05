@@ -149,13 +149,13 @@ func TestEraseRegionAlignment(t *testing.T) {
 	}
 
 	// Misaligned offset
-	err := f.EraseRegion(0x100, 0x1000)
+	err := f.EraseRegion(0x100, 0x1000, nil)
 	if err == nil {
 		t.Error("expected error for misaligned offset")
 	}
 
 	// Misaligned size
-	err = f.EraseRegion(0x1000, 0x100)
+	err = f.EraseRegion(0x1000, 0x100, nil)
 	if err == nil {
 		t.Error("expected error for misaligned size")
 	}
