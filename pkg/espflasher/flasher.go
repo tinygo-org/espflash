@@ -63,6 +63,9 @@ type FlasherOptions struct {
 	// If nil, messages are discarded silently.
 	Logger Logger
 
+	// ConnectStatus, if non-nil, receives status updates during connection setup.
+	ConnectStatus ConnectStatusFunc
+
 	// SerialOpener, if non-nil, is used instead of serial.Open for all
 	// port opens (initial and reopen-after-USB-reenumeration). Useful for
 	// callers that multiplex port access across a monitor and the flasher.
@@ -78,6 +81,24 @@ type Logger interface {
 // ProgressFunc is called with progress updates during flashing.
 // current is the bytes transferred so far, total is the total bytes.
 type ProgressFunc func(current, total int)
+
+// ConnectPhase identifies a stage of the bootloader connection sequence.
+type ConnectPhase string
+
+const (
+	ConnectPhaseReset      ConnectPhase = "reset"
+	ConnectPhaseSync       ConnectPhase = "sync"
+	ConnectPhaseDetectChip ConnectPhase = "detect_chip"
+	ConnectPhaseLoadStub   ConnectPhase = "load_stub"
+)
+
+// ConnectStatusFunc receives status updates during the Flasher connection
+// setup sequence (reset, sync, chip detection, stub load). For phases with a
+// bounded retry loop (reset/sync), attempt and maxAttempts report progress
+// through that loop; phases without a natural retry count pass 0 for both.
+// message is a short human-readable description. It is best-effort and must
+// never affect connection success.
+type ConnectStatusFunc func(phase ConnectPhase, attempt, maxAttempts int, message string)
 
 // DefaultOptions returns FlasherOptions with sensible defaults.
 func DefaultOptions() *FlasherOptions {
@@ -304,6 +325,8 @@ func (f *Flasher) connect() error {
 	}
 
 	for attempt := 0; attempt < attempts; attempt++ {
+		f.connectStatus(ConnectPhaseReset, attempt+1, attempts, "entering download mode")
+
 		// Reset the chip into bootloader mode
 		switch f.opts.ResetMode {
 		case ResetDefault:
@@ -349,6 +372,7 @@ func (f *Flasher) connect() error {
 		// ResetNoReset: skip reset entirely
 
 		// Try to sync with the bootloader
+		f.connectStatus(ConnectPhaseSync, attempt+1, attempts, "syncing")
 		time.Sleep(100 * time.Millisecond) // Give bootloader time to start
 		f.conn.flushInput()
 		for range 5 {
@@ -387,6 +411,7 @@ synced:
 
 	// Detect chip type
 	if f.opts.ChipType == ChipAuto {
+		f.connectStatus(ConnectPhaseDetectChip, 0, 0, "detecting chip")
 		chip, err := f.detectChip()
 		if err != nil {
 			return err
@@ -420,6 +445,7 @@ synced:
 	// Upload the stub loader to enable advanced features (erase, compression, etc.).
 	if s, ok := stubFor(f.chip.ChipType); ok {
 		f.logf("Loading stub loader...")
+		f.connectStatus(ConnectPhaseLoadStub, 0, 0, "loading stub")
 		if err := f.conn.loadStub(s); err != nil {
 			f.logf("Warning: could not load stub: %v", err)
 		} else {
@@ -1049,6 +1075,14 @@ func compressData(data []byte) ([]byte, error) {
 func (f *Flasher) logf(format string, args ...interface{}) {
 	if f.opts.Logger != nil {
 		f.opts.Logger.Logf(format, args...)
+	}
+}
+
+// connectStatus emits a connect-phase status update if a ConnectStatus
+// callback is configured. Purely observational; never affects control flow.
+func (f *Flasher) connectStatus(phase ConnectPhase, attempt, maxAttempts int, message string) {
+	if f.opts.ConnectStatus != nil {
+		f.opts.ConnectStatus(phase, attempt, maxAttempts, message)
 	}
 }
 
