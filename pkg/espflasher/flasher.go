@@ -81,9 +81,10 @@ type Logger interface {
 // ProgressFunc is called with progress updates during long-running
 // operations. The meaning of current and total is operation-defined: for
 // flashing and reading, they are bytes transferred and total bytes; for
-// erase, they are elapsed and estimated-total milliseconds, since erase is
-// a single blocking command with no per-chunk protocol seam to report exact
-// byte progress.
+// erase and GetFlashMD5, they are elapsed and estimated-total milliseconds,
+// since both are single blocking commands with no per-chunk protocol seam
+// to report exact byte progress — the device stays silent for the duration
+// and reports no real completion percentage.
 type ProgressFunc func(current, total int)
 
 // ConnectPhase identifies a stage of the bootloader connection sequence.
@@ -985,7 +986,13 @@ func (f *Flasher) GetSecurityInfo() (*SecurityInfo, error) {
 
 // GetFlashMD5 returns the MD5 hash of a flash region.
 // Requires the stub loader to be running.
-func (f *Flasher) GetFlashMD5(offset, size uint32) (string, error) {
+//
+// If progress is non-nil, it is called periodically with a synthetic ETA
+// (elapsed and estimated milliseconds) ticked against the same size-scaled
+// timeout used internally for the MD5 command, since the device stays
+// silent for the duration of the hash computation and reports no real
+// completion percentage. Pass nil to skip this entirely.
+func (f *Flasher) GetFlashMD5(offset, size uint32, progress ProgressFunc) (string, error) {
 	if !f.conn.isStub() {
 		return "", &UnsupportedCommandError{Command: "flash MD5 (requires stub)"}
 	}
@@ -994,11 +1001,101 @@ func (f *Flasher) GetFlashMD5(offset, size uint32) (string, error) {
 		return "", err
 	}
 
-	result, err := f.conn.flashMD5(offset, size)
+	if progress == nil {
+		result, err := f.conn.flashMD5(offset, size)
+		if err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(result), nil
+	}
+
+	var result []byte
+	err := tickMD5(md5TimeoutForSize(size), md5ProgressInterval, progress, func() error {
+		r, err := f.conn.flashMD5(offset, size)
+		if err != nil {
+			return err
+		}
+		result = r
+		return nil
+	})
 	if err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(result), nil
+}
+
+// md5ProgressInterval is the tick interval used by tickMD5 when reporting
+// synthetic MD5 progress via GetFlashMD5.
+const md5ProgressInterval = 500 * time.Millisecond
+
+// tickMD5 runs work (a blocking flash-MD5 call) while emitting synthetic ETA
+// progress updates against est every interval, until work returns. progress
+// is called with (elapsedMs, estMs), capped so elapsed never reaches est
+// until work has actually completed successfully. On success, a final
+// progress(estMs, estMs) call is emitted; on error, no such call is made.
+//
+// Intermediate ETA ticks are best-effort: they run on a background ticker
+// goroutine, so a panic from the caller's progress callback during such a
+// tick is recovered and that tick is dropped silently rather than crashing
+// the process. The final completion progress(estMs, estMs) call runs
+// synchronously in the caller's goroutine (via the deferred cleanup below),
+// so a panic there propagates to the caller normally.
+//
+// The ticker goroutine only ever calls progress — it never touches the
+// connection — and is always stopped and joined before tickMD5 returns, via
+// a deferred cleanup registered before work is invoked. This holds even if
+// work panics: the deferred cleanup still runs during unwinding, the ticker
+// goroutine is joined, and the panic is left to propagate afterward without
+// emitting a bogus final progress(estMs, estMs) call.
+func tickMD5(est, interval time.Duration, progress ProgressFunc, work func() error) error {
+	estMs := int(est / time.Millisecond)
+	if estMs < 1 {
+		estMs = 1
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		start := time.Now()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				elapsedMs := int(time.Since(start) / time.Millisecond)
+				if elapsedMs >= estMs {
+					elapsedMs = estMs - 1
+				}
+				// Intermediate ticks are best-effort: a panicking
+				// callback drops this tick but must not crash the
+				// process or leak the ticker goroutine.
+				func() {
+					defer func() { _ = recover() }()
+					progress(elapsedMs, estMs)
+				}()
+			}
+		}
+	}()
+
+	var success bool
+	defer func() {
+		close(done)
+		<-stopped
+		if success {
+			progress(estMs, estMs)
+		}
+	}()
+
+	if err := work(); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }
 
 // ReadFlash reads data from flash memory.

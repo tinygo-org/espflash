@@ -542,10 +542,7 @@ func (c *conn) flashMD5(addr, size uint32) ([]byte, error) {
 	binary.LittleEndian.PutUint32(data[12:16], 0)
 
 	// MD5 can take a while for large regions
-	timeout := md5Timeout
-	if size > 1024*1024 {
-		timeout = time.Duration(float64(md5Timeout) * float64(size) / float64(1024*1024))
-	}
+	timeout := md5TimeoutForSize(size)
 
 	result, err := c.checkCommand("flash MD5", cmdSPIFlashMD5, data, 0, timeout, 16)
 	if err != nil {
@@ -666,6 +663,15 @@ func eraseTimeoutForSize(size uint32) time.Duration {
 		t = 10 * time.Second
 	}
 	return t
+}
+
+// md5TimeoutForSize calculates an appropriate timeout for MD5 hash
+// operations, since larger regions can take a while to hash.
+func md5TimeoutForSize(size uint32) time.Duration {
+	if size <= 1024*1024 {
+		return md5Timeout
+	}
+	return time.Duration(float64(md5Timeout) * float64(size) / float64(1024*1024))
 }
 
 // flashWriteTimeoutForSize calculates an appropriate ack timeout for
