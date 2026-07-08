@@ -38,6 +38,21 @@ const (
 type Entry struct {
 	Namespace string
 	Key       string
-	Type      string      // "u8", "u16", "u32", "i8", "i16", "i32", "string", "blob"
+	Type      string      // "u8", "u16", "u32", "i8", "i16", "i32", "string", "blob", or "raw"
 	Value     interface{}
+
+	// Raw entries are captured via generic passthrough when ParseNVS encounters
+	// a type byte it does not natively decode (future/vendor NVS types, or the
+	// blob-index/blob-data entries ESP-IDF uses for chunked values such as
+	// esp_wifi credentials). When Raw is true, GenerateNVS ignores Type/Value
+	// and re-emits the slot(s) byte-for-byte from TypeByte/Span/ChunkIndex/Data
+	// so a read-modify-write round trip never drops or corrupts data it does
+	// not understand.
+	Raw        bool
+	TypeByte   uint8  // raw NVS entry-type byte (entryBytes[1])
+	Span       uint8  // number of 32-byte slots this entry occupies, header included
+	ChunkIndex uint8  // NVS chunk index; 0xFF (singleChunkIndex) means "not chunked"
+	Data       []byte // raw payload: first 8 bytes are the entry header's "data" field
+	// (entryBytes[24:32]); any remaining bytes are the verbatim continuation
+	// slot(s) content, length exactly (Span-1)*EntrySize.
 }

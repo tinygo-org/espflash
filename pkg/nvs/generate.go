@@ -45,16 +45,25 @@ func GenerateNVS(entries []Entry, partitionSize int) ([]byte, error) {
 		partition[i] = 0xFF
 	}
 
-	// Group entries by namespace
+	// Group entries by namespace. Namespace order is recorded as first-seen
+	// in the input slice (rather than ranged over the map) so GenerateNVS is
+	// deterministic: Go map iteration order is randomized, which previously
+	// made repeated calls with identical input produce different partition
+	// layouts.
 	namespaceMap := make(map[string][]*Entry)
+	var nsOrder []string
 	for i, e := range entries {
+		if _, seen := namespaceMap[e.Namespace]; !seen {
+			nsOrder = append(nsOrder, e.Namespace)
+		}
 		namespaceMap[e.Namespace] = append(namespaceMap[e.Namespace], &entries[i])
 	}
 
 	// Process each namespace
 	pageIdx := 0
 	nsCounter := uint8(0)
-	for ns, nsEntries := range namespaceMap {
+	for _, ns := range nsOrder {
+		nsEntries := namespaceMap[ns]
 		nsCounter++
 		// Write namespace entry first — type is U8 with data = namespace index
 		nsEntry := newEntry()
@@ -91,6 +100,10 @@ func GenerateNVS(entries []Entry, partitionSize int) ([]byte, error) {
 
 // parseEntry converts an Entry to one or more internal entries (for multi-span strings/blobs)
 func parseEntry(e *Entry, namespaceIdx uint8) ([]*entry, error) {
+	if e.Raw {
+		return buildRawEntry(e, namespaceIdx)
+	}
+
 	var result []*entry
 
 	switch e.Type {
@@ -297,7 +310,49 @@ func parseEntry(e *Entry, namespaceIdx uint8) ([]*entry, error) {
 	return result, nil
 }
 
-// writePage writes entries to pages and returns number of pages written
+// buildRawEntry re-encodes a passthrough Entry (Entry.Raw == true) byte-for-
+// byte, using its captured TypeByte/Span/ChunkIndex/Data instead of
+// interpreting Type/Value. This is what makes read-modify-write lossless for
+// entry types ParseNVS doesn't natively decode: it never needs to understand
+// the value's semantics to re-emit an equivalent slot.
+func buildRawEntry(e *Entry, namespaceIdx uint8) ([]*entry, error) {
+	if len(e.Data) < 8 {
+		return nil, fmt.Errorf("raw entry %q: Data must be at least 8 bytes (entry header), got %d", e.Key, len(e.Data))
+	}
+
+	span := e.Span
+	if span == 0 {
+		span = spanOne
+	}
+	wantContLen := (int(span) - 1) * EntrySize
+	if len(e.Data) != 8+wantContLen {
+		return nil, fmt.Errorf("raw entry %q: Data length %d does not match span %d (want %d)", e.Key, len(e.Data), span, 8+wantContLen)
+	}
+
+	ent := newEntry()
+	ent.namespaceIdx = namespaceIdx
+	ent.entryType = e.TypeByte
+	ent.span = span
+	ent.chunkIndex = e.ChunkIndex
+	copyKeyToEntry(e.Key, ent)
+	copy(ent.data[:], e.Data[:8])
+	ent.crc32Val = calculateEntryCRC32(ent)
+	if wantContLen > 0 {
+		ent.rawData = e.Data[8:]
+	}
+
+	return []*entry{ent}, nil
+}
+
+// writePage writes entries to pages and returns number of pages written.
+//
+// Mirrors ESP-IDF's Page::writeItem: an item's header slot and all of its
+// continuation/data slots are always written together on a single page.
+// Before placing an item, the full slot count it needs is computed; if it
+// doesn't fit in the current page's remaining slots, the current page is
+// finalized as-is (its remaining slots stay Empty/0xFF) and the *entire*
+// item is written on a fresh page instead. An item's span never crosses a
+// page boundary.
 func writePage(partition *[]byte, startPageNum int, seqNum uint32, entries []*entry, totalPages int) (int, error) {
 	pageNum := startPageNum
 	pageOffset := pageNum * PageSize
@@ -309,28 +364,47 @@ func writePage(partition *[]byte, startPageNum int, seqNum uint32, entries []*en
 	}
 
 	// Write header
-	writePageHeader(page, seqNum)
+	writePageHeader(page, seqNum+uint32(pageNum-startPageNum))
 
 	// Write entry bitmap and entries
 	bitmapOffset := HeaderSize
 	slotIdx := 0
 
+	startNewPage := func() error {
+		pageNum++
+		if pageNum >= totalPages {
+			return fmt.Errorf("not enough pages: need at least %d pages", pageNum+1)
+		}
+		pageOffset = pageNum * PageSize
+		page = (*partition)[pageOffset : pageOffset+PageSize]
+		// Initialize new page with 0xFF
+		for i := range page {
+			page[i] = 0xFF
+		}
+		// Write header
+		writePageHeader(page, seqNum+uint32(pageNum-startPageNum))
+		slotIdx = 0
+		return nil
+	}
+
 	for _, e := range entries {
-		if slotIdx >= EntriesPerPage {
-			// Need another page
-			pageNum++
-			if pageNum >= totalPages {
-				return 0, fmt.Errorf("not enough pages: need at least %d pages", pageNum+1)
+		dataSlots := 0
+		if e.rawData != nil {
+			dataSlots = int(e.span) - 1 // header slot already accounted separately
+		}
+		entryCount := 1 + dataSlots // header slot + continuation/data slots
+
+		if entryCount > EntriesPerPage {
+			return 0, fmt.Errorf("entry %q: needs %d slots, which exceeds a single page's capacity (%d); ESP-IDF requires an item's header and all continuation slots to fit within one page", readNullTerminatedString(e.key[:]), entryCount, EntriesPerPage)
+		}
+
+		// Fit check: if this item (header + continuation slots, as a whole)
+		// won't fit in what remains of the current page, close the current
+		// page and start the whole item fresh on a new page.
+		if slotIdx+entryCount > EntriesPerPage {
+			if err := startNewPage(); err != nil {
+				return 0, err
 			}
-			pageOffset = pageNum * PageSize
-			page = (*partition)[pageOffset : pageOffset+PageSize]
-			// Initialize new page with 0xFF
-			for i := range page {
-				page[i] = 0xFF
-			}
-			// Write header
-			writePageHeader(page, seqNum+uint32(pageNum))
-			slotIdx = 0
 		}
 
 		// Mark slot as written in bitmap
@@ -341,40 +415,21 @@ func writePage(partition *[]byte, startPageNum int, seqNum uint32, entries []*en
 		writeEntry(page[entryOffset:entryOffset+EntrySize], e)
 		slotIdx++
 
-		// For string/blob entries, write raw data into subsequent slots
-		if e.rawData != nil {
-			dataSlots := int(e.span) - 1 // header already written
-			for ds := 0; ds < dataSlots; ds++ {
-				if slotIdx >= EntriesPerPage {
-					// Need another page
-					pageNum++
-					if pageNum >= totalPages {
-						return 0, fmt.Errorf("not enough pages: need at least %d pages", pageNum+1)
-					}
-					pageOffset = pageNum * PageSize
-					page = (*partition)[pageOffset : pageOffset+PageSize]
-					// Initialize new page with 0xFF
-					for i := range page {
-						page[i] = 0xFF
-					}
-					// Write header
-					writePageHeader(page, seqNum+uint32(pageNum))
-					slotIdx = 0
-				}
-
-				markBitmapWritten(page, bitmapOffset, slotIdx)
-				dataOffset := FirstEntryOffset + slotIdx*EntrySize
-				// Copy chunk of raw data, rest stays 0xFF
-				start := ds * EntrySize
-				end := start + EntrySize
-				if end > len(e.rawData) {
-					end = len(e.rawData)
-				}
-				if start < len(e.rawData) {
-					copy(page[dataOffset:dataOffset+EntrySize], e.rawData[start:end])
-				}
-				slotIdx++
+		// Write raw continuation data into the following slots. These are
+		// guaranteed by the fit check above to remain on this same page.
+		for ds := 0; ds < dataSlots; ds++ {
+			markBitmapWritten(page, bitmapOffset, slotIdx)
+			dataOffset := FirstEntryOffset + slotIdx*EntrySize
+			// Copy chunk of raw data, rest stays 0xFF
+			start := ds * EntrySize
+			end := start + EntrySize
+			if end > len(e.rawData) {
+				end = len(e.rawData)
 			}
+			if start < len(e.rawData) {
+				copy(page[dataOffset:dataOffset+EntrySize], e.rawData[start:end])
+			}
+			slotIdx++
 		}
 	}
 

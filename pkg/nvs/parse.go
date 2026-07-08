@@ -3,44 +3,71 @@ package nvs
 import (
 	"encoding/binary"
 	"fmt"
+	"sort"
 )
+
+// rawSlotEntry is the structural (type-agnostic) decode of one NVS entry
+// record: namespace/key/type/span/chunkIndex plus the 8-byte header "data"
+// field. It does not yet know the namespace *name* (only its index) because
+// the namespace declaration for that index may live on a page scanned later
+// than the key that references it.
+type rawSlotEntry struct {
+	pageNum      int
+	slotIdx      int
+	namespaceIdx uint8
+	entryType    uint8
+	span         uint8
+	chunkIndex   uint8
+	key          string
+	headerData   []byte // 8 bytes, entryBytes[24:32]
+}
+
+// pageRecord is a validated page ready for the structural scan, tagged with
+// its physical index and the sequence number from its header.
+type pageRecord struct {
+	pageNum int
+	seqNum  uint32
+	page    []byte
+}
 
 // ParseNVS reads an NVS partition binary and returns a flat slice of entries.
 // It handles:
-// - Page validation (state, version, header CRC)
-// - Entry bitmap decoding
-// - Namespace mapping
-// - Multi-span entries (strings and blobs)
-// - Value decoding based on type
-// - Deduplication (last write wins)
+//   - Page validation (state, version, header CRC)
+//   - Entry bitmap decoding
+//   - Namespace mapping, independent of scan order (a key may be declared
+//     before its namespace's declaration entry, e.g. on a page scanned later)
+//   - Multi-slot entries (strings and blobs); per ESP-IDF's on-flash format an
+//     item's header + all continuation slots always live on a single page, so
+//     each is read entirely within its own page
+//   - Value decoding based on type, with lossless generic passthrough for any
+//     type this codec does not natively model (see Entry.Raw)
+//   - Deduplication (last write wins), keyed by namespace+key+chunkIndex so
+//     chunked entries (e.g. esp_wifi blob-index credentials) that legitimately
+//     share a key are not collapsed into one. Pages are scanned in ascending
+//     order of their header sequence number (not physical/flash order, which
+//     ESP-IDF explicitly does not guarantee reflects write chronology), so
+//     later-seq writes naturally overwrite earlier ones for the same key.
 func ParseNVS(data []byte) ([]Entry, error) {
 	// Validate data length is a multiple of PageSize
 	if len(data)%PageSize != 0 {
 		return nil, fmt.Errorf("data length (%d) must be a multiple of PageSize (%d)", len(data), PageSize)
 	}
 
-	// Map from namespace index to namespace name
-	namespaceMap := make(map[uint8]string)
-
-	// Map from "namespace:key" to entry, for deduplication (last write wins)
-	entryMap := make(map[string]*Entry)
-
-	// Walk pages
 	totalPages := len(data) / PageSize
+
+	// Pass 1: validate each page and collect the ones worth scanning,
+	// tagged with their header sequence number.
+	var pages []pageRecord
 	for pageNum := 0; pageNum < totalPages; pageNum++ {
 		pageOffset := pageNum * PageSize
 		page := data[pageOffset : pageOffset+PageSize]
 
-		// Check page state
 		state := page[0]
 		if state == pageStateEmpty {
-			// Skip empty pages
 			continue
 		}
 
-		// Validate page version at byte 8
 		if page[8] != pageVersion {
-			// Skip pages with wrong version
 			continue
 		}
 
@@ -51,12 +78,42 @@ func ParseNVS(data []byte) ([]Entry, error) {
 			return nil, fmt.Errorf("page %d header CRC mismatch: expected 0x%x, got 0x%x", pageNum, expectedCRC, actualCRC)
 		}
 
-		// Read entry bitmap at HeaderSize (bytes 32-63)
-		// Walk through bitmap, looking for entries with state = entryStateWritten (0b10)
-		processedSlots := make(map[int]bool) // Track multi-span entries
+		seqNum := binary.LittleEndian.Uint32(page[4:8])
+		pages = append(pages, pageRecord{pageNum: pageNum, seqNum: seqNum, page: page})
+	}
+
+	// Scan pages in ascending sequence-number order, not physical order:
+	// ESP-IDF decouples page write chronology from physical placement, so the
+	// sequence number in the page header is the only reliable ordering for
+	// "last write wins" semantics. Ties (which shouldn't occur in a valid
+	// partition) fall back to physical order for determinism.
+	sort.SliceStable(pages, func(i, j int) bool {
+		if pages[i].seqNum != pages[j].seqNum {
+			return pages[i].seqNum < pages[j].seqNum
+		}
+		return pages[i].pageNum < pages[j].pageNum
+	})
+
+	// Map from namespace index to namespace name. Populated as namespace
+	// declarations are encountered during the structural walk below; only
+	// consulted after that walk completes, so scan order never causes a key
+	// to be dropped for "namespace not yet defined".
+	namespaceMap := make(map[uint8]string)
+
+	// Structural walk: decode every written entry record on every valid
+	// page, in sequence-number order. Namespace declarations are resolved
+	// immediately (they're never namespaced themselves); everything else is
+	// queued for phase 2.
+	var rawEntries []rawSlotEntry
+
+	for _, pr := range pages {
+		page := pr.page
+		pageNum := pr.pageNum
+
+		processedSlots := make(map[int]bool) // Track multi-slot entries
 
 		for slotIdx := 0; slotIdx < EntriesPerPage; slotIdx++ {
-			// Skip if already processed as part of multi-span
+			// Skip if already processed as part of a multi-slot entry
 			if processedSlots[slotIdx] {
 				continue
 			}
@@ -82,85 +139,159 @@ func ParseNVS(data []byte) ([]Entry, error) {
 			namespaceIdx := entryBytes[0]
 			entryType := entryBytes[1]
 			span := entryBytes[2]
-			// chunkIndex := entryBytes[3] // Not used for parsing
+			if span == 0 {
+				span = 1
+			}
+			chunkIndex := entryBytes[3]
 			// crc32Val := binary.LittleEndian.Uint32(entryBytes[4:8]) // TODO: validate CRC
 			key := readNullTerminatedString(entryBytes[8:24])
-			dataBytes := entryBytes[24:32]
+			headerData := append([]byte(nil), entryBytes[24:32]...)
 
-			// Mark all slots used by this entry as processed
-			for s := 0; s < int(span); s++ {
-				processedSlots[slotIdx+s] = true
+			// Mark slots used by this entry's continuation as processed.
+			// ESP-IDF never splits an item across pages: an item's header +
+			// continuation slots are always fully contained within one page
+			// (see Page::writeItem in nvs_page.cpp). If a span byte claims
+			// more continuation slots than remain on this page, that layout
+			// cannot come from a real ESP-IDF partition; treat it as
+			// corrupt and clamp to what's actually present on this page
+			// rather than reaching into the next page's slots.
+			contNeeded := int(span) - 1
+			s := slotIdx + 1
+			for contNeeded > 0 && s < EntriesPerPage {
+				processedSlots[s] = true
+				s++
+				contNeeded--
+			}
+			if contNeeded > 0 {
+				span -= uint8(contNeeded)
 			}
 
 			// Handle namespace entries (namespaceIdx == 0)
 			if namespaceIdx == 0 && entryType == namespaceType {
-				nsIndex := dataBytes[0]
+				nsIndex := headerData[0]
 				namespaceMap[nsIndex] = key
 				continue
 			}
 
-			// Look up namespace name
-			namespaceName, ok := namespaceMap[namespaceIdx]
-			if !ok {
-				// Namespace not yet defined, skip for now
-				continue
-			}
-
-			// Decode value based on type
-			var value interface{}
-			var err error
-
-			switch entryType {
-			case typeU8:
-				value = dataBytes[0]
-
-			case typeU16:
-				value = binary.LittleEndian.Uint16(dataBytes[0:2])
-
-			case typeU32:
-				value = binary.LittleEndian.Uint32(dataBytes[0:4])
-
-			case typeI8:
-				value = int8(dataBytes[0])
-
-			case typeI16:
-				value = int16(binary.LittleEndian.Uint16(dataBytes[0:2]))
-
-			case typeI32:
-				value = int32(binary.LittleEndian.Uint32(dataBytes[0:4]))
-
-			case typeString:
-				value, err = readStringEntry(page, pageNum, slotIdx, dataBytes, span)
-				if err != nil {
-					return nil, err
-				}
-
-			case typeBlob:
-				value, err = readBlobEntry(page, pageNum, slotIdx, dataBytes, span)
-				if err != nil {
-					return nil, err
-				}
-
-			default:
-				// Skip unknown types
-				continue
-			}
-
-			// Create entry and store in map (deduplication: last write wins)
-			mapKey := fmt.Sprintf("%s:%s", namespaceName, key)
-			entryMap[mapKey] = &Entry{
-				Namespace: namespaceName,
-				Key:       key,
-				Type:      typeToString(entryType),
-				Value:     value,
-			}
+			rawEntries = append(rawEntries, rawSlotEntry{
+				pageNum:      pageNum,
+				slotIdx:      slotIdx,
+				namespaceIdx: namespaceIdx,
+				entryType:    entryType,
+				span:         span,
+				chunkIndex:   chunkIndex,
+				key:          key,
+				headerData:   headerData,
+			})
 		}
 	}
 
-	// Convert map to flat slice
-	var result []Entry
-	for _, e := range entryMap {
-		result = append(result, *e)
+	// Phase 2: resolve namespace names (now fully known, regardless of the
+	// scan order in which declarations vs. keys were encountered) and decode
+	// each entry's value, deduplicating on (namespace, key, chunkIndex) so
+	// last-write-wins semantics hold without collapsing distinct chunks of a
+	// chunked value that happen to share a key. rawEntries is already in
+	// ascending page-sequence order, so a later overwrite of an earlier map
+	// entry here means "higher sequence number wins".
+	type dedupKey struct {
+		namespace  string
+		key        string
+		chunkIndex uint8
+	}
+	entryMap := make(map[dedupKey]*Entry)
+	var order []dedupKey // first-seen order, for stable output
+
+	for _, re := range rawEntries {
+		namespaceName, ok := namespaceMap[re.namespaceIdx]
+		if !ok {
+			// Orphaned key: no namespace declaration found anywhere in the
+			// partition for this index. Nothing to resolve it to; drop it.
+			continue
+		}
+
+		var value interface{}
+		var err error
+		raw := false
+
+		pageOffset := re.pageNum * PageSize
+		page := data[pageOffset : pageOffset+PageSize]
+
+		switch re.entryType {
+		case typeU8:
+			value = re.headerData[0]
+
+		case typeU16:
+			value = binary.LittleEndian.Uint16(re.headerData[0:2])
+
+		case typeU32:
+			value = binary.LittleEndian.Uint32(re.headerData[0:4])
+
+		case typeI8:
+			value = int8(re.headerData[0])
+
+		case typeI16:
+			value = int16(binary.LittleEndian.Uint16(re.headerData[0:2]))
+
+		case typeI32:
+			value = int32(binary.LittleEndian.Uint32(re.headerData[0:4]))
+
+		case typeString:
+			value, err = readStringEntry(page, re.slotIdx, re.headerData, re.span)
+			if err != nil {
+				return nil, err
+			}
+
+		case typeBlob:
+			value, err = readBlobEntry(page, re.slotIdx, re.headerData, re.span)
+			if err != nil {
+				return nil, err
+			}
+
+		default:
+			// Unknown/unmodeled type: capture generically instead of
+			// dropping it, so a read-modify-write round trip is lossless
+			// even for entries this codec doesn't semantically understand
+			// (e.g. ESP-IDF blob-index/blob-data chunk entries).
+			raw = true
+		}
+
+		dk := dedupKey{namespace: namespaceName, key: re.key, chunkIndex: re.chunkIndex}
+		if _, exists := entryMap[dk]; !exists {
+			order = append(order, dk)
+		}
+
+		if raw {
+			spanData := readSpanData(page, re.slotIdx, re.span)
+			rawData := make([]byte, 0, len(re.headerData)+len(spanData))
+			rawData = append(rawData, re.headerData...)
+			rawData = append(rawData, spanData...)
+			entryMap[dk] = &Entry{
+				Namespace:  namespaceName,
+				Key:        re.key,
+				Type:       "raw",
+				Raw:        true,
+				TypeByte:   re.entryType,
+				Span:       re.span,
+				ChunkIndex: re.chunkIndex,
+				Data:       rawData,
+			}
+			continue
+		}
+
+		entryMap[dk] = &Entry{
+			Namespace:  namespaceName,
+			Key:        re.key,
+			Type:       typeToString(re.entryType),
+			Value:      value,
+			ChunkIndex: re.chunkIndex,
+		}
+	}
+
+	// Convert map to flat slice in first-seen order (values reflect the last
+	// write per the deduplication above).
+	result := make([]Entry, 0, len(order))
+	for _, dk := range order {
+		result = append(result, *entryMap[dk])
 	}
 
 	return result, nil
@@ -176,32 +307,40 @@ func readNullTerminatedString(b []byte) string {
 	return string(b)
 }
 
-// readStringEntry reads a string entry from data and subsequent span entries
-func readStringEntry(page []byte, pageNum int, slotIdx int, headerData []byte, span uint8) (string, error) {
+// readSpanData reads the raw continuation payload for an entry that occupies
+// `span` 32-byte slots (header slot included), starting at slotIdx, entirely
+// within `page`. ESP-IDF never splits an item's entries across pages (see
+// Page::writeItem in nvs_page.cpp): if an item doesn't fit in the remaining
+// slots of the current page, the whole item — header and all continuation
+// slots together — is written on a fresh page instead. So a span is always
+// read within a single page; it never reaches into a neighboring page.
+func readSpanData(page []byte, slotIdx int, span uint8) []byte {
+	remaining := int(span) - 1
+	if remaining <= 0 {
+		return nil
+	}
+
+	var buf []byte
+	slot := slotIdx + 1
+	for i := 0; i < remaining && slot < EntriesPerPage; i, slot = i+1, slot+1 {
+		dataOffset := FirstEntryOffset + slot*EntrySize
+		if dataOffset+EntrySize > len(page) {
+			break
+		}
+		buf = append(buf, page[dataOffset:dataOffset+EntrySize]...)
+	}
+
+	return buf
+}
+
+// readStringEntry reads a string entry's value from within a single page.
+func readStringEntry(page []byte, slotIdx int, headerData []byte, span uint8) (string, error) {
 	strLen := binary.LittleEndian.Uint16(headerData[0:2])
 	if strLen == 0 {
 		return "", nil
 	}
 
-	// Read data from subsequent span slots
-	var buf []byte
-	currentSlot := slotIdx + 1
-
-	for i := 0; i < int(span)-1; i++ {
-		if currentSlot >= EntriesPerPage {
-			// Would need to read from next page, but for simplicity assume fits in current page
-			// In a full implementation, would handle page boundaries
-			break
-		}
-
-		dataOffset := FirstEntryOffset + currentSlot*EntrySize
-		if dataOffset+EntrySize > len(page) {
-			break
-		}
-
-		buf = append(buf, page[dataOffset:dataOffset+EntrySize]...)
-		currentSlot++
-	}
+	buf := readSpanData(page, slotIdx, span)
 
 	// Trim to actual length and remove null terminator
 	if int(strLen) > len(buf) {
@@ -214,32 +353,14 @@ func readStringEntry(page []byte, pageNum int, slotIdx int, headerData []byte, s
 	return string(result), nil
 }
 
-// readBlobEntry reads a blob entry from data and subsequent span entries
-func readBlobEntry(page []byte, pageNum int, slotIdx int, headerData []byte, span uint8) ([]byte, error) {
+// readBlobEntry reads a blob entry's value from within a single page.
+func readBlobEntry(page []byte, slotIdx int, headerData []byte, span uint8) ([]byte, error) {
 	blobLen := binary.LittleEndian.Uint16(headerData[0:2])
 	if blobLen == 0 {
 		return []byte{}, nil
 	}
 
-	// Read data from subsequent span slots
-	var buf []byte
-	currentSlot := slotIdx + 1
-
-	for i := 0; i < int(span)-1; i++ {
-		if currentSlot >= EntriesPerPage {
-			// Would need to read from next page, but for simplicity assume fits in current page
-			// In a full implementation, would handle page boundaries
-			break
-		}
-
-		dataOffset := FirstEntryOffset + currentSlot*EntrySize
-		if dataOffset+EntrySize > len(page) {
-			break
-		}
-
-		buf = append(buf, page[dataOffset:dataOffset+EntrySize]...)
-		currentSlot++
-	}
+	buf := readSpanData(page, slotIdx, span)
 
 	// Trim to actual length (no null terminator for blobs)
 	if int(blobLen) > len(buf) {
