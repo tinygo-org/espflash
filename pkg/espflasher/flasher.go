@@ -70,6 +70,16 @@ type FlasherOptions struct {
 	// port opens (initial and reopen-after-USB-reenumeration). Useful for
 	// callers that multiplex port access across a monitor and the flasher.
 	SerialOpener func(name string, mode *serial.Mode) (serial.Port, error)
+
+	// SkipStub, when true, skips uploading the stub loader during connect.
+	// Stub-dependent features (whole-chip erase, compression, etc.) are
+	// unavailable, but ROM operations (register read/write, flash read/write
+	// via ROM, chip detect) still work. Useful for register-only workflows
+	// (e.g. GPIO probing) that don't need the stub, and for avoiding a
+	// resident stub that can cause a subsequent no-reset reconnect to
+	// mis-detect the chip.
+	// Default: false (stub is loaded as today).
+	SkipStub bool
 }
 
 // Logger is the interface for receiving progress and status messages.
@@ -447,7 +457,9 @@ synced:
 	}
 
 	// Upload the stub loader to enable advanced features (erase, compression, etc.).
-	if s, ok := stubFor(f.chip.ChipType); ok {
+	if f.opts.SkipStub {
+		f.logf("Skipping stub loader (SkipStub set); ROM bootloader only.")
+	} else if s, ok := stubFor(f.chip.ChipType); ok {
 		f.logf("Loading stub loader...")
 		f.connectStatus(ConnectPhaseLoadStub, 0, 0, "loading stub")
 		if err := f.conn.loadStub(s); err != nil {

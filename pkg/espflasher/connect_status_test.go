@@ -100,6 +100,56 @@ func TestConnectStatusNilCallbackNoBehaviorChange(t *testing.T) {
 	}
 }
 
+// TestConnectSkipsStubWhenSkipStubSet verifies that with SkipStub=true,
+// connect() does not upload the stub loader even for a chip that has one.
+func TestConnectSkipsStubWhenSkipStubSet(t *testing.T) {
+	var loadStubCalled bool
+	mc := esp32DetectMockConnection()
+	mc.loadStubFunc = func(s *stub) error {
+		loadStubCalled = true
+		return nil
+	}
+
+	f := &Flasher{
+		port: &mockPort{},
+		conn: mc,
+		opts: &FlasherOptions{
+			ChipType:        ChipAuto,
+			ResetMode:       ResetNoReset,
+			ConnectAttempts: 7,
+			SkipStub:        true,
+		},
+	}
+
+	if err := f.connect(); err != nil {
+		t.Fatalf("connect() error: %v", err)
+	}
+	if loadStubCalled {
+		t.Error("loadStub should not be called when SkipStub is true")
+	}
+}
+
+// TestConnectLoadsStubByDefault verifies that with SkipStub left at its
+// zero value (false), connect() still uploads the stub loader for a chip
+// that has one — i.e. today's behavior is unchanged.
+func TestConnectLoadsStubByDefault(t *testing.T) {
+	var loadStubCalled bool
+	mc := esp32DetectMockConnection()
+	mc.loadStubFunc = func(s *stub) error {
+		loadStubCalled = true
+		return nil
+	}
+
+	f := newConnectTestFlasher(mc, 7, nil)
+
+	if err := f.connect(); err != nil {
+		t.Fatalf("connect() error: %v", err)
+	}
+	if !loadStubCalled {
+		t.Error("loadStub should be called by default (SkipStub=false)")
+	}
+}
+
 // Note: a test asserting the attempt counter increments across a
 // failed-then-succeeding retry sequence was considered but is infeasible
 // with the existing mock infra. When every sync try in an attempt fails,
