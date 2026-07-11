@@ -76,6 +76,7 @@ const (
 	chipEraseTimeout    = 120 * time.Second
 	md5Timeout          = 30 * time.Second
 	eraseWritePerMBRate = 10 * time.Second // per megabyte
+	flashWritePerMBRate = 40 * time.Second // per megabyte
 )
 
 // conn wraps the serial port and provides the low-level protocol operations.
@@ -424,7 +425,8 @@ func (c *conn) flashData(block []byte, seq uint32) error {
 	binary.LittleEndian.PutUint32(data[12:16], 0)
 	copy(data[16:], block)
 
-	_, err := c.checkCommand("write flash block", cmdFlashData, data, checksum(block), defaultTimeout, 0)
+	timeout := flashWriteTimeoutForSize(uint32(len(block)))
+	_, err := c.checkCommand("write flash block", cmdFlashData, data, checksum(block), timeout, 0)
 	return err
 }
 
@@ -675,13 +677,14 @@ func md5TimeoutForSize(size uint32) time.Duration {
 }
 
 // flashWriteTimeoutForSize calculates an appropriate ack timeout for
-// compressed flash write/finish commands, scaled by data size using the
-// same per-MB rate as eraseTimeoutForSize. Unlike erase (which floors at
-// 10s for a whole-region operation), write/finish acks are per-block or
-// per-image and use the smaller defaultTimeout floor so small writes
-// aren't over-inflated.
+// flash write/finish commands, scaled by data size. Flash writes (and
+// especially compressed writes that must be decompressed before being
+// programmed) can take substantially longer than the erase rate on slower
+// ESP32 processors, so this uses a more generous per-MB rate than
+// eraseTimeoutForSize. The floor remains defaultTimeout so small blocks
+// are not over-inflated.
 func flashWriteTimeoutForSize(size uint32) time.Duration {
-	t := defaultTimeout + time.Duration(float64(eraseWritePerMBRate)*float64(size)/float64(1024*1024))
+	t := defaultTimeout + time.Duration(float64(flashWritePerMBRate)*float64(size)/float64(1024*1024))
 	if t < defaultTimeout {
 		t = defaultTimeout
 	}

@@ -110,9 +110,10 @@ func TestEraseTimeoutForSize(t *testing.T) {
 }
 
 func TestFlashWriteTimeoutForSize(t *testing.T) {
-	// E1-15 regression: compressed flash write/finish acks must scale by
-	// size (mirroring eraseTimeoutForSize), with a floor of defaultTimeout
-	// so small blocks aren't over-inflated.
+	// E1-15 regression: flash write/finish acks must scale by size, with a
+	// floor of defaultTimeout so small blocks aren't over-inflated. Flash
+	// writes use a more generous per-MB rate than erase because the stub
+	// must decompress and program each block before acking.
 	tests := []struct {
 		name string
 		size uint32
@@ -131,9 +132,9 @@ func TestFlashWriteTimeoutForSize(t *testing.T) {
 		})
 	}
 
-	// A 4MB compressed write must get a materially larger timeout than a
-	// 4KB block, so large transfers over slow USB-serial bridges don't
-	// time out on a flat ack wait.
+	// A 4MB write must get a materially larger timeout than a 4KB block,
+	// so large transfers over slow USB-serial bridges don't time out on a
+	// flat ack wait.
 	small := flashWriteTimeoutForSize(4 * 1024)
 	large := flashWriteTimeoutForSize(4 * 1024 * 1024)
 	if large <= small {
@@ -141,6 +142,14 @@ func TestFlashWriteTimeoutForSize(t *testing.T) {
 	}
 	if large < 2*small {
 		t.Errorf("expected 4MB timeout to be materially larger than 4KB timeout: small=%v large=%v", small, large)
+	}
+
+	// Flash writes are given a longer per-MB budget than erase to account
+	// for decompression + programming on slower ESP32 processors.
+	erase := eraseTimeoutForSize(1024 * 1024)
+	write := flashWriteTimeoutForSize(1024 * 1024)
+	if write <= erase {
+		t.Errorf("expected flash write timeout > erase timeout for same size: erase=%v write=%v", erase, write)
 	}
 }
 
