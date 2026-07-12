@@ -111,14 +111,20 @@ func main() {
 - **Multi-image support**: Flash bootloader, partition table, and application in one operation
 - **Progress callbacks**: Monitor flash progress in real-time
 - **MD5 verification**: Verifies written data integrity after flashing
+- **Flash readback**: Read flash contents back with byte-accurate progress reporting
+- **GPIO access**: Read, drive, and release GPIO pins over the ROM/stub connection on ESP32, ESP32-S2, ESP32-C3, and ESP32-S3
+- **Connection hooks**: Display connection-phase status updates or override serial port opening when integrating with monitors or custom transports
 - **Configurable**: Customize baud rate, compression, reset mode, and more
 - **USB-JTAG/Serial**: Native USB support for boards like ESP32-S3 and ESP32-C3 that expose a built-in USB-JTAG/Serial interface (typically `/dev/ttyACM0` on Linux, `cu.usbmodem*` on macOS)
 - **Stubs**: Use stubs for higher-speed downloads and other advanced processor features
-- **NVS support**: Generate and parse ESP-IDF NVS (Non-Volatile Storage) partition images in pure Go
+- **Stub control**: Opt out of loading the stub for register-level workflows that only need ROM functionality
+- **NVS support**: Generate and parse ESP-IDF NVS (Non-Volatile Storage) partition images in pure Go, including lossless read-modify-write of unknown and chunked entries
 
 ## NVS Package
 
 The `nvs` package provides a pure-Go implementation for generating and parsing [ESP-IDF NVS (Non-Volatile Storage)](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/storage/nvs_flash.html) partition images in the v2 binary format.
+
+It is suitable for read-modify-write workflows: `ParseNVS` preserves unknown entry types and ESP-IDF chunked blob entries so `GenerateNVS` can round-trip them without data loss.
 
 ### Installation
 
@@ -196,6 +202,13 @@ flasher, err := espflasher.New("/dev/ttyUSB0", opts)
 // For boards with native USB-JTAG/Serial (ESP32-S3, ESP32-C3, etc.)
 opts.ResetMode = espflasher.ResetUSBJTAG
 flasher, err := espflasher.New("/dev/ttyACM0", opts)
+
+// Surface connection phases and skip the stub for ROM-only workflows.
+opts.ConnectStatus = func(phase espflasher.ConnectPhase, attempt, maxAttempts int, message string) {
+    fmt.Printf("[%s] %s\n", phase, message)
+}
+opts.SkipStub = true
+flasher, err := espflasher.New("/dev/ttyUSB0", opts)
 ```
 
 ### Flashing a Single Binary
@@ -229,6 +242,25 @@ err := flasher.EraseRegion(0x10000, 0x100000, nil)
 err := flasher.EraseFlash(func(current, total int) {
 	fmt.Printf("erasing... %dms / %dms\n", current, total)
 })
+
+// Read back flash with byte-accurate progress
+data, err := flasher.ReadFlash(0x10000, 0x20000, func(current, total int) {
+    fmt.Printf("read %d / %d bytes\n", current, total)
+})
+
+// Ask the device to compute an MD5 for a flash region
+sum, err := flasher.GetFlashMD5(0x10000, uint32(len(data)), func(current, total int) {
+    fmt.Printf("md5... %dms / %dms\n", current, total)
+})
+
+// Probe and temporarily drive a GPIO on supported chips
+reserved, reason := flasher.GPIOReserved(2)
+if reserved {
+    fmt.Printf("GPIO2 is reserved: %s\n", reason)
+}
+level, err := flasher.ReadGPIO(2)
+err = flasher.SetGPIO(2, !level)
+err = flasher.ReleaseGPIO(2)
 
 // Read a hardware register
 val, err := flasher.ReadRegister(0x3FF00050)
