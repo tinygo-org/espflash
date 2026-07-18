@@ -92,6 +92,10 @@ type conn struct {
 	// deflCompSize is the compressed size passed to the most recent
 	// flashDeflBegin call, used to scale the flashDeflEnd ack timeout.
 	deflCompSize uint32
+	// deflUncompSize is the uncompressed size passed to the most recent
+	// flashDeflBegin call, used with deflCompSize to estimate the
+	// decompression ratio for per-block timeouts in flashDeflData.
+	deflUncompSize uint32
 }
 
 // isStub returns whether the stub loader is running.
@@ -456,9 +460,11 @@ func (c *conn) flashDeflBegin(uncompSize, compSize, offset uint32, encrypted boo
 
 	timeout := eraseTimeoutForSize(uncompSize)
 
-	// Remember the compressed size for this download so flashDeflEnd can
-	// scale its own ack timeout the same way.
+	// Remember sizes for this download so flashDeflData can estimate per-block
+	// decompressed sizes for timeout scaling, and flashDeflEnd can scale its
+	// own ack timeout.
 	c.deflCompSize = compSize
+	c.deflUncompSize = uncompSize
 
 	// ESP32-S2 and newer ROM bootloaders support a 5th parameter (encrypted
 	// flag). ESP8266 and original ESP32 ROM only accept 4 parameters (16 bytes).
@@ -488,7 +494,16 @@ func (c *conn) flashDeflData(block []byte, seq uint32) error {
 	binary.LittleEndian.PutUint32(data[12:16], 0)
 	copy(data[16:], block)
 
-	timeout := flashWriteTimeoutForSize(uint32(len(block)))
+	// The stub must decompress this block and write the result to flash
+	// before ACKing. The decompressed data can be much larger than the
+	// compressed block, so scale the timeout by the compression ratio
+	// to account for the actual flash write time.
+	estimatedSize := uint32(len(block))
+	if c.deflCompSize > 0 && c.deflUncompSize > c.deflCompSize {
+		ratio := float64(c.deflUncompSize) / float64(c.deflCompSize)
+		estimatedSize = uint32(float64(len(block)) * ratio)
+	}
+	timeout := flashWriteTimeoutForSize(estimatedSize)
 	_, err := c.checkCommand("write compressed flash block", cmdFlashDeflData, data, checksum(block), timeout, 0)
 	return err
 }

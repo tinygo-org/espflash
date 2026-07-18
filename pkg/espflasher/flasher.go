@@ -737,8 +737,10 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 		blockLen := min(compSize-sent, writeSize)
 
 		block := compressed[sent : sent+blockLen]
-		if err := f.conn.flashDeflData(block, seq); err != nil {
-			return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
+		if err := f.retryFlashBlock(seq, numBlocks, func() error {
+			return f.conn.flashDeflData(block, seq)
+		}); err != nil {
+			return err
 		}
 
 		sent += blockLen
@@ -810,8 +812,10 @@ func (f *Flasher) flashUncompressed(data []byte, offset uint32, progress Progres
 			block = padded
 		}
 
-		if err := f.conn.flashData(block, seq); err != nil {
-			return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
+		if err := f.retryFlashBlock(seq, numBlocks, func() error {
+			return f.conn.flashData(block, seq)
+		}); err != nil {
+			return err
 		}
 
 		sent += blockLen
@@ -922,6 +926,13 @@ func (f *Flasher) EraseRegion(offset, size uint32, progress ProgressFunc) error 
 		return f.conn.eraseRegion(offset, size)
 	})
 }
+
+// flashBlockRetries is the number of attempts for each flash data block write.
+// Transient serial errors (SLIP timeouts, framing glitches, USB CDC buffer
+// drops) are common during flashing and typically resolve on retry. The stub
+// handles duplicate sequence numbers gracefully, so resending an
+// already-processed block is safe.
+const flashBlockRetries = 3
 
 // eraseProgressInterval is the tick interval used by tickErase when reporting
 // synthetic erase progress via EraseFlash and EraseRegion.
@@ -1267,6 +1278,33 @@ func compressData(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// retryFlashBlock attempts a flash block write up to flashBlockRetries times.
+// On failure, it flushes stale serial data and waits briefly before retrying.
+// This handles transient SLIP timeouts and framing errors that are common
+// during ESP32 flash operations, matching esptool.py's WRITE_BLOCK_ATTEMPTS
+// retry behavior.
+func (f *Flasher) retryFlashBlock(seq, numBlocks uint32, writeFn func() error) error {
+	var err error
+	for attempt := range flashBlockRetries {
+		err = writeFn()
+		if err == nil {
+			return nil
+		}
+		if attempt < flashBlockRetries-1 {
+			f.logf("Warning: block %d/%d write failed (attempt %d/%d): %v — retrying",
+				seq, numBlocks, attempt+1, flashBlockRetries, err)
+			// Wait before flushing so a delayed response from the timed-out
+			// attempt has time to arrive and gets cleared by the flush.
+			// Without this ordering, the stale response arrives after the
+			// flush and corrupts the retry's response parsing (e.g. SLIP
+			// END 0xC0 read as a status byte).
+			time.Sleep(200 * time.Millisecond)
+			f.conn.flushInput()
+		}
+	}
+	return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
 }
 
 // logf logs a message if a logger is configured.
