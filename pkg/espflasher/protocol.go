@@ -71,12 +71,29 @@ const (
 
 // Default timeouts
 const (
-	defaultTimeout      = 3 * time.Second
-	syncTimeout         = 100 * time.Millisecond
-	chipEraseTimeout    = 120 * time.Second
-	md5Timeout          = 30 * time.Second
-	eraseWritePerMBRate = 10 * time.Second // per megabyte
-	flashWritePerMBRate = 40 * time.Second // per megabyte
+	defaultTimeout       = 3 * time.Second
+	syncTimeout          = 100 * time.Millisecond
+	chipEraseTimeout     = 120 * time.Second
+	md5Timeout           = 30 * time.Second
+	eraseWritePerMBRate  = 10 * time.Second // per megabyte
+	flashWritePerMBRate  = 40 * time.Second // per megabyte
+	flashWriteMinTimeout = 10 * time.Second // minimum timeout for any flash write
+
+	// stubFlashPageDelay is the estimated time for the ESP32 ROM to program
+	// one 256-byte flash page. The stub uses double-buffering: it ACKs each
+	// flash data block immediately and writes to flash as a post-process.
+	// During the flash write, the ROM disables interrupts (required because
+	// the SPI bus is shared with the cache and the cache must be disabled
+	// while programming). If the next block's data arrives at the UART
+	// during this window, the 128-byte hardware FIFO overflows and data is
+	// silently lost. After receiving the ACK, we sleep for the estimated
+	// flash write duration to let the post-process finish before sending
+	// more data.
+	//
+	// Typical values: 0.2–0.7 ms (Winbond W25Q), up to 3 ms worst-case.
+	// We use 1 ms as a conservative default that covers common flash chips
+	// with margin.
+	stubFlashPageDelay = 1 * time.Millisecond
 )
 
 // conn wraps the serial port and provides the low-level protocol operations.
@@ -164,7 +181,20 @@ func (c *conn) sendCommand(opcode byte, data []byte, chk uint32) error {
 			return err
 		}
 	}
-	return nil
+
+	// Wait for the kernel to finish transmitting the frame data to the USB
+	// device. Without this, Write returns as soon as data is copied to the
+	// kernel buffer, and the caller may issue the next command before the
+	// previous frame has physically left the host. This matters for flash
+	// data commands: the stub uses double-buffering — it ACKs each block
+	// immediately and performs the actual flash write as a post-process.
+	// If the next block arrives while the stub is still writing flash
+	// (which may briefly disable interrupts on ESP32), the UART RX FIFO
+	// can overflow, silently losing data and causing a timeout. Drain
+	// ensures each frame is committed to the USB-UART bridge before we
+	// proceed, adding a small but deterministic delay that gives the stub
+	// more time between consecutive commands.
+	return c.port.Drain()
 }
 
 // commandResponse represents a parsed response from the ESP device.
@@ -431,7 +461,11 @@ func (c *conn) flashData(block []byte, seq uint32) error {
 
 	timeout := flashWriteTimeoutForSize(uint32(len(block)))
 	_, err := c.checkCommand("write flash block", cmdFlashData, data, checksum(block), timeout, 0)
-	return err
+	if err != nil {
+		return err
+	}
+	c.waitForStubFlashWrite(uint32(len(block)))
+	return nil
 }
 
 // flashEnd finishes flash download. If reboot is true, the device reboots.
@@ -494,10 +528,12 @@ func (c *conn) flashDeflData(block []byte, seq uint32) error {
 	binary.LittleEndian.PutUint32(data[12:16], 0)
 	copy(data[16:], block)
 
-	// The stub must decompress this block and write the result to flash
-	// before ACKing. The decompressed data can be much larger than the
-	// compressed block, so scale the timeout by the compression ratio
-	// to account for the actual flash write time.
+	// The stub uses double-buffering: it validates and ACKs this command
+	// immediately, then decompresses and writes to flash as a post-process
+	// after the response is sent. The decompressed data can be much larger
+	// than the compressed block, so scale the timeout by the compression
+	// ratio to account for the flash write time that occurs before the
+	// stub is ready for the next command.
 	estimatedSize := uint32(len(block))
 	if c.deflCompSize > 0 && c.deflUncompSize > c.deflCompSize {
 		ratio := float64(c.deflUncompSize) / float64(c.deflCompSize)
@@ -505,7 +541,11 @@ func (c *conn) flashDeflData(block []byte, seq uint32) error {
 	}
 	timeout := flashWriteTimeoutForSize(estimatedSize)
 	_, err := c.checkCommand("write compressed flash block", cmdFlashDeflData, data, checksum(block), timeout, 0)
-	return err
+	if err != nil {
+		return err
+	}
+	c.waitForStubFlashWrite(estimatedSize)
+	return nil
 }
 
 // flashDeflEnd finishes compressed flash download.
@@ -672,6 +712,18 @@ func (c *conn) flushInput() {
 	c.reader.reset()
 }
 
+// waitForStubFlashWrite sleeps to let the stub's flash write post-process
+// complete before the caller sends the next command. See stubFlashPageDelay
+// for the full rationale. When the ROM bootloader is active (no stub), the
+// flash write completes synchronously before the ACK, so no delay is needed.
+func (c *conn) waitForStubFlashWrite(dataSize uint32) {
+	if !c.stub || dataSize == 0 {
+		return
+	}
+	pages := (dataSize + 255) / 256
+	time.Sleep(time.Duration(pages) * stubFlashPageDelay)
+}
+
 // eraseTimeoutForSize calculates an appropriate timeout for erase operations.
 func eraseTimeoutForSize(size uint32) time.Duration {
 	// Base timeout + per-MB rate
@@ -696,12 +748,13 @@ func md5TimeoutForSize(size uint32) time.Duration {
 // especially compressed writes that must be decompressed before being
 // programmed) can take substantially longer than the erase rate on slower
 // ESP32 processors, so this uses a more generous per-MB rate than
-// eraseTimeoutForSize. The floor remains defaultTimeout so small blocks
-// are not over-inflated.
+// eraseTimeoutForSize. The floor is flashWriteMinTimeout (10s) rather than
+// defaultTimeout, because individual block writes can stall while the stub
+// erases flash sectors before programming.
 func flashWriteTimeoutForSize(size uint32) time.Duration {
-	t := defaultTimeout + time.Duration(float64(flashWritePerMBRate)*float64(size)/float64(1024*1024))
-	if t < defaultTimeout {
-		t = defaultTimeout
+	t := flashWriteMinTimeout + time.Duration(float64(flashWritePerMBRate)*float64(size)/float64(1024*1024))
+	if t < flashWriteMinTimeout {
+		t = flashWriteMinTimeout
 	}
 	return t
 }

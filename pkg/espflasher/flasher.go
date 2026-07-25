@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -741,7 +742,7 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 		if err := f.retryFlashBlock(seq, numBlocks, func() error {
 			return f.conn.flashDeflData(block, seq)
 		}); err != nil {
-			return err
+			return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
 		}
 
 		sent += blockLen
@@ -759,9 +760,10 @@ func (f *Flasher) flashCompressed(data []byte, offset uint32, progress ProgressF
 	// bootloader upon receiving it, which can interfere with flash operations.
 	// esptool also skips this for ROM: "skip sending flash_finish to ROM loader,
 	// as it causes the loader to exit and run user code."
-	// For the stub, the end command acts as a write barrier: the stub ACKs each
-	// block on receive but writes to flash asynchronously, so the end command
-	// ensures the last block is actually written before we proceed.
+	// For the stub, the end command acts as a write barrier: the stub uses
+	// double-buffering (ACKs each block immediately, writes to flash as a
+	// post-process), so the end command ensures the last block's flash write
+	// has completed before we proceed.
 	if f.conn.isStub() {
 		if err := f.conn.flashDeflEnd(false); err != nil {
 			return err
@@ -816,7 +818,7 @@ func (f *Flasher) flashUncompressed(data []byte, offset uint32, progress Progres
 		if err := f.retryFlashBlock(seq, numBlocks, func() error {
 			return f.conn.flashData(block, seq)
 		}); err != nil {
-			return err
+			return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
 		}
 
 		sent += blockLen
@@ -882,7 +884,7 @@ func (f *Flasher) EraseFlash(progress ProgressFunc) error {
 		return &UnsupportedCommandError{Command: "erase flash (requires stub)"}
 	}
 
-	f.logf("Erasing entire flash...")
+	f.logf("Erasing flash...")
 	if progress == nil {
 		if err := f.conn.eraseFlash(); err != nil {
 			return err
@@ -928,16 +930,18 @@ func (f *Flasher) EraseRegion(offset, size uint32, progress ProgressFunc) error 
 	})
 }
 
-// flashBlockRetries is the number of attempts for each flash data block write.
-// Transient serial errors (SLIP timeouts, framing glitches, USB CDC buffer
-// drops) are common during flashing and typically resolve on retry. The stub
-// handles duplicate sequence numbers gracefully, so resending an
-// already-processed block is safe.
-const flashBlockRetries = 3
-
 // eraseProgressInterval is the tick interval used by tickErase when reporting
 // synthetic erase progress via EraseFlash and EraseRegion.
 const eraseProgressInterval = 500 * time.Millisecond
+
+// flashBlockRetries is the number of attempts for each flash data block write.
+// At high baud rates (460800+), USB-UART bridges occasionally lose bytes during
+// transmission, causing the stub to receive a truncated or corrupted SLIP frame.
+// The stub detects this (bad data length or bad checksum) and responds with a
+// clean error, leaving it ready for a resend. We retry only for these
+// serial-integrity errors; device-side failures (SPI errors, inflate errors)
+// are not retried.
+const flashBlockRetries = 3
 
 // tickErase runs work (a blocking erase call) while emitting synthetic ETA
 // progress updates against est every interval, until work returns. progress
@@ -1281,11 +1285,30 @@ func compressData(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// retryFlashBlock attempts a flash block write up to flashBlockRetries times.
-// On failure, it flushes stale serial data and waits briefly before retrying.
-// This handles transient SLIP timeouts and framing errors that are common
-// during ESP32 flash operations, matching esptool.py's WRITE_BLOCK_ATTEMPTS
-// retry behavior.
+// logf logs a message if a logger is configured.
+func (f *Flasher) logf(format string, args ...interface{}) {
+	if f.opts.Logger != nil {
+		f.opts.Logger.Logf(format, args...)
+	}
+}
+
+// retryFlashBlock calls writeFn up to flashBlockRetries times, retrying on
+// errors that indicate transient serial data loss. Two cases are retried:
+//
+//  1. CommandError with IsRetryable() (bad data length / bad checksum): the
+//     stub received a corrupted frame and responded with a clean error. It is
+//     ready for a resend.
+//
+//  2. TimeoutError: the stub never responded, likely because bytes were lost
+//     during UART transmission, leaving the stub waiting for the rest of an
+//     incomplete SLIP frame. On resend, the leading 0xC0 terminates the stub's
+//     partial frame; the stub may then emit a stale error response for the
+//     truncated frame before processing our retry, which is handled by the
+//     next retry iteration.
+//
+// Between retries the serial RX buffer and SLIP reader are flushed so stale
+// responses from partial-frame cleanup don't corrupt subsequent reads.
+// Device-side failures (SPI errors, inflate errors) are NOT retried.
 func (f *Flasher) retryFlashBlock(seq, numBlocks uint32, writeFn func() error) error {
 	var err error
 	for attempt := range flashBlockRetries {
@@ -1293,26 +1316,32 @@ func (f *Flasher) retryFlashBlock(seq, numBlocks uint32, writeFn func() error) e
 		if err == nil {
 			return nil
 		}
+		if !isRetryableFlashError(err) {
+			return err
+		}
 		if attempt < flashBlockRetries-1 {
 			f.logf("Warning: block %d/%d write failed (attempt %d/%d): %v — retrying",
 				seq, numBlocks, attempt+1, flashBlockRetries, err)
-			// Wait before flushing so a delayed response from the timed-out
-			// attempt has time to arrive and gets cleared by the flush.
-			// Without this ordering, the stale response arrives after the
-			// flush and corrupts the retry's response parsing (e.g. SLIP
-			// END 0xC0 read as a status byte).
-			time.Sleep(200 * time.Millisecond)
+			// Flush stale data so the retry starts with a clean serial state.
+			// After a timeout the stub may still be holding a partial frame;
+			// our next send's leading 0xC0 will terminate it, producing a
+			// stale error response that the flush on the FOLLOWING iteration
+			// (if needed) will clear.
 			f.conn.flushInput()
 		}
 	}
-	return fmt.Errorf("flash block %d of %d: %w", seq, numBlocks, err)
+	return err
 }
 
-// logf logs a message if a logger is configured.
-func (f *Flasher) logf(format string, args ...interface{}) {
-	if f.opts.Logger != nil {
-		f.opts.Logger.Logf(format, args...)
+// isRetryableFlashError returns true if the error is a transient serial-link
+// issue (data corruption or loss) that can be recovered by resending.
+func isRetryableFlashError(err error) bool {
+	var cmdErr *CommandError
+	if errors.As(err, &cmdErr) {
+		return cmdErr.IsRetryable()
 	}
+	var timeoutErr *TimeoutError
+	return errors.As(err, &timeoutErr)
 }
 
 // connectStatus emits a connect-phase status update if a ConnectStatus

@@ -8,24 +8,39 @@ import (
 func TestCommandError(t *testing.T) {
 	tests := []struct {
 		name     string
+		status   byte
 		errCode  byte
 		contains string
 	}{
-		{"invalid message", 0x05, "received message is invalid"},
-		{"failed to act", 0x06, "failed to act on received message"},
-		{"invalid CRC", 0x07, "invalid CRC in message"},
-		{"flash write", 0x08, "flash write error"},
-		{"flash read", 0x09, "flash read error"},
-		{"flash read length", 0x0A, "flash read length error"},
-		{"deflate error", 0x0B, "deflate error"},
-		{"unknown error", 0xFF, "unknown error"},
+		// ROM bootloader error codes
+		{"invalid message", 0x01, 0x05, "received message is invalid"},
+		{"failed to act", 0x01, 0x06, "failed to act on received message"},
+		{"invalid CRC", 0x01, 0x07, "invalid CRC in message"},
+		{"flash write", 0x01, 0x08, "flash write error"},
+		{"flash read", 0x01, 0x09, "flash read error"},
+		{"flash read length", 0x01, 0x0A, "flash read length error"},
+		{"deflate error", 0x01, 0x0B, "deflate error"},
+		{"unknown ROM error", 0x01, 0xFF, "unknown error"},
+		// Stub response codes (v1.1.0+)
+		{"bad data length", 0xC0, 0x00, "bad data length"},
+		{"bad data checksum", 0xC1, 0x00, "bad data checksum"},
+		{"bad block size", 0xC2, 0x00, "bad block size"},
+		{"invalid command", 0xC3, 0x00, "invalid command"},
+		{"SPI op failed", 0xC4, 0x00, "SPI operation failed"},
+		{"SPI unlock failed", 0xC5, 0x00, "SPI unlock failed"},
+		{"not in flash mode", 0xC6, 0x00, "not in flash mode"},
+		{"inflate error", 0xC7, 0x00, "inflate error"},
+		{"not enough data", 0xC8, 0x00, "not enough data"},
+		{"too much data", 0xC9, 0x00, "too much data"},
+		{"cmd not implemented", 0xFF, 0x00, "command not implemented"},
+		{"unknown stub error", 0xCF, 0x00, "unknown error"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := &CommandError{
 				OpCode:  0x02,
-				Status:  0x01,
+				Status:  tt.status,
 				ErrCode: tt.errCode,
 			}
 			msg := err.Error()
@@ -52,6 +67,29 @@ func TestCommandErrorFormat(t *testing.T) {
 	}
 	if !strings.Contains(msg, "error=0x05") {
 		t.Errorf("missing error code in: %q", msg)
+	}
+}
+
+func TestCommandErrorIsRetryable(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    byte
+		errCode   byte
+		retryable bool
+	}{
+		{"bad data length", 0xC0, 0x00, true},
+		{"bad data checksum", 0xC1, 0x00, true},
+		{"SPI op failed", 0xC4, 0x00, false},
+		{"inflate error", 0xC7, 0x00, false},
+		{"ROM error", 0x01, 0x05, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &CommandError{Status: tt.status, ErrCode: tt.errCode}
+			if err.IsRetryable() != tt.retryable {
+				t.Errorf("IsRetryable() = %v, want %v", err.IsRetryable(), tt.retryable)
+			}
+		})
 	}
 }
 
