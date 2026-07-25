@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	stubVersion = "v0.5.1"
+	stubVersion = "v1.1.0"
 	baseURL     = "https://github.com/espressif/esp-flasher-stub/releases/download/" + stubVersion
 )
 
