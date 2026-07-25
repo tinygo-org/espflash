@@ -159,6 +159,7 @@ type connection interface {
 	eraseRegion(offset, size uint32) error
 	readFlash(offset, size uint32, progress ProgressFunc) ([]byte, error)
 	flushInput()
+	terminatePartialFrame()
 	isStub() bool
 	setUSB(v bool)
 	setSupportsEncryptedFlash(v bool)
@@ -578,6 +579,13 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 		return fmt.Errorf("attach flash: %w", err)
 	}
 
+	// Cap baud rate for UART-bridge chips prone to FIFO overflow.
+	if f.chip != nil && f.chip.MaxUARTFlashBaud > 0 && !f.usesUSB &&
+		f.opts.FlashBaudRate > f.chip.MaxUARTFlashBaud {
+		f.logf("Limiting flash baud rate to %d (UART bridge on %s)", f.chip.MaxUARTFlashBaud, f.chip.Name)
+		f.opts.FlashBaudRate = f.chip.MaxUARTFlashBaud
+	}
+
 	// Optionally switch to higher baud rate (not supported by ESP8266 ROM)
 	canChangeBaud := f.chip == nil || f.chip.ROMHasChangeBaud || f.conn.isStub()
 	if canChangeBaud && f.opts.FlashBaudRate > 0 && f.opts.FlashBaudRate != f.opts.BaudRate {
@@ -639,6 +647,13 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 	if f.chip != nil && f.chip.ChipType == ChipESP8266 &&
 		(f.opts.FlashMode == "" || f.opts.FlashMode == "keep") {
 		f.opts.FlashMode = "dout"
+	}
+
+	// Cap baud rate for UART-bridge chips prone to FIFO overflow.
+	if f.chip != nil && f.chip.MaxUARTFlashBaud > 0 && !f.usesUSB &&
+		f.opts.FlashBaudRate > f.chip.MaxUARTFlashBaud {
+		f.logf("Limiting flash baud rate to %d (UART bridge on %s)", f.chip.MaxUARTFlashBaud, f.chip.Name)
+		f.opts.FlashBaudRate = f.chip.MaxUARTFlashBaud
 	}
 
 	// Optionally switch to higher baud rate (not supported by ESP8266 ROM)
@@ -935,13 +950,17 @@ func (f *Flasher) EraseRegion(offset, size uint32, progress ProgressFunc) error 
 const eraseProgressInterval = 500 * time.Millisecond
 
 // flashBlockRetries is the number of attempts for each flash data block write.
-// At high baud rates (460800+), USB-UART bridges occasionally lose bytes during
-// transmission, causing the stub to receive a truncated or corrupted SLIP frame.
-// The stub detects this (bad data length or bad checksum) and responds with a
-// clean error, leaving it ready for a resend. We retry only for these
-// serial-integrity errors; device-side failures (SPI errors, inflate errors)
-// are not retried.
-const flashBlockRetries = 3
+// USB-UART bridges occasionally lose bytes during transmission, causing the stub
+// to receive a truncated or corrupted SLIP frame. After a timeout, the first
+// retry's leading 0xC0 terminates the stub's partial frame, often producing a
+// stale "bad data length" error that consumes one retry for cleanup. With 5
+// retries we get at least 3 clean attempts after any such cleanup cycle.
+const flashBlockRetries = 5
+
+// flashBlockRetryDelay is the delay between flash block retries, allowing
+// in-flight stale responses from the stub to arrive and be flushed before
+// the next attempt.
+const flashBlockRetryDelay = 50 * time.Millisecond
 
 // tickErase runs work (a blocking erase call) while emitting synthetic ETA
 // progress updates against est every interval, until work returns. progress
@@ -1301,13 +1320,23 @@ func (f *Flasher) logf(format string, args ...interface{}) {
 //
 //  2. TimeoutError: the stub never responded, likely because bytes were lost
 //     during UART transmission, leaving the stub waiting for the rest of an
-//     incomplete SLIP frame. On resend, the leading 0xC0 terminates the stub's
-//     partial frame; the stub may then emit a stale error response for the
-//     truncated frame before processing our retry, which is handled by the
-//     next retry iteration.
+//     incomplete SLIP frame.
 //
-// Between retries the serial RX buffer and SLIP reader are flushed so stale
-// responses from partial-frame cleanup don't corrupt subsequent reads.
+// After a timeout, the stub may be holding a partial frame. To clean up
+// without corrupting the decompressor state (which is critical for compressed
+// flash writes), we:
+//  1. Send a bare SLIP end byte (0xC0) to terminate the stub's partial frame.
+//  2. Wait briefly for the stub to emit a stale error response for the
+//     truncated data.
+//  3. Flush the serial RX buffer to discard that stale response.
+//  4. Retry with a clean serial state.
+//
+// This prevents the retry data from being concatenated with the partial-frame
+// termination in a single write, which would cause the stub to process both
+// the cleanup and the retry as separate commands — advancing the decompressor
+// state on the "invisible" second command while we read the stale error from
+// the first.
+//
 // Device-side failures (SPI errors, inflate errors) are NOT retried.
 func (f *Flasher) retryFlashBlock(seq, numBlocks uint32, writeFn func() error) error {
 	var err error
@@ -1322,15 +1351,26 @@ func (f *Flasher) retryFlashBlock(seq, numBlocks uint32, writeFn func() error) e
 		if attempt < flashBlockRetries-1 {
 			f.logf("Warning: block %d/%d write failed (attempt %d/%d): %v — retrying",
 				seq, numBlocks, attempt+1, flashBlockRetries, err)
-			// Flush stale data so the retry starts with a clean serial state.
-			// After a timeout the stub may still be holding a partial frame;
-			// our next send's leading 0xC0 will terminate it, producing a
-			// stale error response that the flush on the FOLLOWING iteration
-			// (if needed) will clear.
+
+			// If this was a timeout, the stub is likely holding a partial SLIP
+			// frame. Send a bare 0xC0 to terminate it cleanly, then wait for
+			// the stale error response before flushing and retrying.
+			if isTimeoutError(err) {
+				f.conn.terminatePartialFrame()
+			}
+
+			// Wait for any stale responses to arrive, then flush them.
+			time.Sleep(flashBlockRetryDelay)
 			f.conn.flushInput()
 		}
 	}
 	return err
+}
+
+// isTimeoutError returns true if err is a TimeoutError.
+func isTimeoutError(err error) bool {
+	var te *TimeoutError
+	return errors.As(err, &te)
 }
 
 // isRetryableFlashError returns true if the error is a transient serial-link

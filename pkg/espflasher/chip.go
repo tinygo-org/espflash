@@ -111,6 +111,13 @@ type chipDef struct {
 	// CHANGE_BAUD command (0x0F). ESP32+ ROMs support this; ESP8266 does not.
 	ROMHasChangeBaud bool
 
+	// MaxUARTFlashBaud caps the flash baud rate for UART bridge connections.
+	// The ESP32 ROM disables interrupts during flash page writes (because
+	// the SPI bus is shared with the cache), causing the 128-byte UART RX
+	// FIFO on common USB-UART bridges (CH340, CP2102) to overflow at high
+	// baud rates. Set to 0 for no cap (native USB chips have flow control).
+	MaxUARTFlashBaud int
+
 	// SPIMISODLenOffs is the register offset for the MISO data bit length
 	// register (relative to SPIRegBase). On ESP32-S2 and newer, MISO/MOSI
 	// lengths are in dedicated registers. On ESP8266 and ESP32, these are 0

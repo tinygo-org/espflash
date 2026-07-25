@@ -626,6 +626,8 @@ func (m *mockConnection) flushInput() {
 	}
 }
 
+func (m *mockConnection) terminatePartialFrame() {}
+
 func (m *mockConnection) readFlash(offset, size uint32, progress ProgressFunc) ([]byte, error) {
 	if m.readFlashFunc != nil {
 		return m.readFlashFunc(offset, size, progress)

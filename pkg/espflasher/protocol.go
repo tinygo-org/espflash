@@ -712,6 +712,16 @@ func (c *conn) flushInput() {
 	c.reader.reset()
 }
 
+// terminatePartialFrame sends a bare SLIP end byte (0xC0) to terminate any
+// partial frame the stub may be holding. This is used during flash write retry
+// cleanup: after a timeout, the stub is likely waiting for the rest of an
+// incomplete SLIP frame. Sending 0xC0 alone (without any command data) makes
+// the stub process the truncated frame and emit an error response, without
+// inadvertently feeding it our retry data as a second command in the same write.
+func (c *conn) terminatePartialFrame() {
+	c.port.Write([]byte{slipEnd}) //nolint:errcheck
+}
+
 // waitForStubFlashWrite sleeps to let the stub's flash write post-process
 // complete before the caller sends the next command. See stubFlashPageDelay
 // for the full rationale. When the ROM bootloader is active (no stub), the

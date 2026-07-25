@@ -56,6 +56,7 @@ var defESP32 = &chipDef{
 
 	ROMHasCompressedFlash: true,
 	ROMHasChangeBaud:      true,
+	MaxUARTFlashBaud:      230400,
 
 	FlashFrequency: map[string]byte{
 		"80m": 0xF,
