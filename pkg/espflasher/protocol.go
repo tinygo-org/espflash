@@ -3,8 +3,10 @@ package espflasher
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"syscall"
 	"time"
 
 	"go.bug.st/serial"
@@ -172,12 +174,12 @@ func (c *conn) sendCommand(opcode byte, data []byte, chk uint32) error {
 			if end > len(frame) {
 				end = len(frame)
 			}
-			if _, err := c.port.Write(frame[off:end]); err != nil {
+			if err := writeRetryEINTR(c.port, frame[off:end]); err != nil {
 				return err
 			}
 		}
 	} else {
-		if _, err := c.port.Write(frame); err != nil {
+		if err := writeRetryEINTR(c.port, frame); err != nil {
 			return err
 		}
 	}
@@ -194,7 +196,38 @@ func (c *conn) sendCommand(opcode byte, data []byte, chk uint32) error {
 	// ensures each frame is committed to the USB-UART bridge before we
 	// proceed, adding a small but deterministic delay that gives the stub
 	// more time between consecutive commands.
-	return c.port.Drain()
+	return drainRetryEINTR(c.port)
+}
+
+// writeRetryEINTR calls port.Write, retrying transparently if interrupted by a
+// signal (EINTR). On Linux, signals such as SIGWINCH can interrupt write(2) on
+// serial file descriptors before any bytes are transferred.
+func writeRetryEINTR(port serial.Port, data []byte) error {
+	for {
+		_, err := port.Write(data)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		return err
+	}
+}
+
+// drainRetryEINTR calls port.Drain, retrying transparently if interrupted by a
+// signal (EINTR). On Linux, tcdrain(3) can be interrupted by any signal.
+func drainRetryEINTR(port serial.Port) error {
+	for {
+		err := port.Drain()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		return err
+	}
 }
 
 // commandResponse represents a parsed response from the ESP device.
