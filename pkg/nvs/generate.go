@@ -355,6 +355,9 @@ func buildRawEntry(e *Entry, namespaceIdx uint8) ([]*entry, error) {
 // page boundary.
 func writePage(partition *[]byte, startPageNum int, seqNum uint32, entries []*entry, totalPages int) (int, error) {
 	pageNum := startPageNum
+	if pageNum >= totalPages {
+		return 0, fmt.Errorf("not enough pages: need at least %d pages", pageNum+1)
+	}
 	pageOffset := pageNum * PageSize
 	page := (*partition)[pageOffset : pageOffset+PageSize]
 

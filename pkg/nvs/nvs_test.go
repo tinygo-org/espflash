@@ -2,6 +2,7 @@ package nvs
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -61,6 +62,49 @@ func TestGenerateNVSValidPartitionSizes(t *testing.T) {
 		require.NoError(t, err, "pages=%d", pages)
 		assert.Equal(t, partSize, len(partition))
 	}
+}
+
+// writePage gives every namespace its own fresh page (it never packs a new
+// namespace's entries into a previous namespace's leftover page slots), so
+// GenerateNVS needs at least as many pages as there are distinct namespaces.
+// When that requirement already exactly exhausts the partition's pages,
+// starting the next namespace calls writePage with startPageNum ==
+// totalPages. writePage's mid-item overflow path (startNewPage) guards
+// against this with a totalPages check, but writePage's *initial* page slice
+// — taken before any entry is placed — had no equivalent guard, so it read
+// straight past the end of the partition slice and panicked instead of
+// returning the same "not enough pages" error. Reproduces the reported
+// esp_nvs_set/esp_nvs_delete panic ("slice bounds out of range [:28672]
+// with capacity 24576") on a stock 6-page (0x6000) NVS partition: 6
+// existing single-key namespaces already consume all 6 pages one-per-
+// namespace, and adding a 7th (brand new) namespace pushes the running page
+// index to exactly 6 == totalPages before any bounds check runs.
+func TestGenerateNVSInsufficientPagesAtNamespaceBoundaryReturnsErrorNotPanic(t *testing.T) {
+	var entries []Entry
+	for i := 0; i < 6; i++ {
+		entries = append(entries, Entry{
+			Namespace: fmt.Sprintf("ns%d", i),
+			Key:       "k",
+			Type:      "u8",
+			Value:     uint8(i),
+		})
+	}
+	// A brand new 7th namespace — mirrors bb_mqtt not existing on the device
+	// yet in the reported repro.
+	entries = append(entries, Entry{
+		Namespace: "bb_mqtt",
+		Key:       "enabled",
+		Type:      "string",
+		Value:     "1",
+	})
+
+	// Must not panic: 6 namespaces already exactly fill a 6-page partition
+	// (page-per-namespace), so the 7th genuinely doesn't fit. This should
+	// surface as the same clean "not enough pages" error writePage's
+	// mid-item overflow path already returns, not a slice-bounds panic.
+	_, err := GenerateNVS(entries, PageSize*6)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not enough pages")
 }
 
 func TestParseNVSEmpty(t *testing.T) {
