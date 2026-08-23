@@ -108,14 +108,20 @@ var defESP32S2 = &chipDef{
 // watchdog disable for USB operation.
 // Reference: esptool/targets/esp32s2.py _post_connect()
 func esp32s2PostConnect(f *Flasher) error {
-	uartDev, err := f.ReadRegister(esp32s2UARTDevBufNo)
-	if err != nil {
-		// In secure download mode, the register may be unreadable.
-		// Default to non-USB behavior (safe fallback).
-		return nil
+	// Prefer VID/PID (as esptool does); fall back to the ROM variable when
+	// the host reports none.
+	usbOTG := f.usbInterfaceFromPort() == usbInterfaceOTG
+	if !usbOTG {
+		uartDev, err := f.ReadRegister(esp32s2UARTDevBufNo)
+		if err != nil {
+			// In secure download mode, the register may be unreadable.
+			// Default to non-USB behavior (safe fallback).
+			return nil
+		}
+		usbOTG = uartDev == esp32s2UARTDevBufNoUSBOTG
 	}
 
-	if uartDev == esp32s2UARTDevBufNoUSBOTG {
+	if usbOTG {
 		f.usesUSB = true
 		f.logf("USB-OTG interface detected")
 	}
