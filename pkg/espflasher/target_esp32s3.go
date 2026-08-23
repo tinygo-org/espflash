@@ -12,6 +12,12 @@ const (
 	esp32s3UARTDevBufNoUSBOTG        uint32 = 3          // USB-OTG (CDC) active
 	esp32s3UARTDevBufNoUSBJTAGSerial uint32 = 4          // USB-JTAG/Serial active
 
+	// RTC_CNTL_OPTION1 force-download-boot bit, set by the ROM on entering
+	// download mode over native USB. Cleared before reset.
+	// Reference: esptool/targets/esp32s3.py hard_reset().
+	esp32s3RTCCntlOption1Reg        uint32 = 0x6000812C
+	esp32s3RTCCntlForceDownloadBoot uint32 = 0x1
+
 	esp32s3RTCCntlWDTConfig0  uint32 = 0x60008098
 	esp32s3RTCCntlWDTWProtect uint32 = 0x600080B0
 	esp32s3RTCCntlWDTWKey     uint32 = 0x50D83AA1
@@ -75,6 +81,9 @@ var defESP32S3 = &chipDef{
 
 	PostConnect: esp32s3PostConnect,
 
+	ForceDownloadBootReg:  esp32s3RTCCntlOption1Reg,
+	ForceDownloadBootMask: esp32s3RTCCntlForceDownloadBoot,
+
 	ReadMAC:          esp32s3ReadMAC,
 	ReadChipRevision: esp32s3ReadChipRevision,
 	ReadChipFeatures: esp32s3ReadChipFeatures,
@@ -85,11 +94,22 @@ var defESP32S3 = &chipDef{
 // during flash and resets the chip mid-operation.
 // Reference: esptool/targets/esp32s3.py _post_connect()
 func esp32s3PostConnect(f *Flasher) error {
-	val, err := f.conn.readReg(esp32s3UARTDevBufNo)
-	if err != nil {
-		// In secure download mode, the register may be unreadable.
-		// Default to non-USB behavior (safe fallback).
-		return nil
+	// Prefer VID/PID (as esptool does); fall back to the ROM variable when
+	// the host reports none.
+	val := uint32(0)
+	switch f.usbInterfaceFromPort() {
+	case usbInterfaceSerialJTAG:
+		val = esp32s3UARTDevBufNoUSBJTAGSerial
+	case usbInterfaceOTG:
+		val = esp32s3UARTDevBufNoUSBOTG
+	default:
+		var err error
+		val, err = f.conn.readReg(esp32s3UARTDevBufNo)
+		if err != nil {
+			// In secure download mode, the register may be unreadable.
+			// Default to non-USB behavior (safe fallback).
+			return nil
+		}
 	}
 
 	switch val {

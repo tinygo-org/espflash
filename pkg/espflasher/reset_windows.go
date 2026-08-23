@@ -12,8 +12,11 @@ import (
 // On Windows, a single hardReset is not sufficient for USB CDC devices.
 // Performing two resets (first non-USB, then USB timing) reliably triggers
 // the chip to restart.
-func hardResetUSB(port serial.Port) {
-	hardReset(port, false)
+func hardResetUSB(port serial.Port) error {
+	err := hardReset(port, false)
 	time.Sleep(defaultResetDelay)
-	hardReset(port, true)
+	if err2 := hardReset(port, true); err == nil {
+		err = err2
+	}
+	return err
 }

@@ -79,12 +79,18 @@ var defESP32P4Rev1 = &chipDef{
 }
 
 func esp32p4Rev1PostConnect(f *Flasher) error {
-	uartDev, err := f.ReadRegister(esp32p4Rev1UARTDevBufNo)
-	if err != nil {
-		return nil
+	// Prefer VID/PID (as esptool does); fall back to the ROM variable when
+	// the host reports none.
+	usbJTAG := f.usbInterfaceFromPort() == usbInterfaceSerialJTAG
+	if !usbJTAG {
+		uartDev, err := f.ReadRegister(esp32p4Rev1UARTDevBufNo)
+		if err != nil {
+			return nil
+		}
+		usbJTAG = uartDev == esp32p4UARTDevBufNoUSBJTAGSerial
 	}
 
-	if uartDev == esp32p4UARTDevBufNoUSBJTAGSerial {
+	if usbJTAG {
 		f.usesUSB = true
 		f.logf("USB-JTAG/Serial interface detected (ESP32-P4 rev1), disabling watchdogs")
 		return disableWatchdogsLP(f, esp32p4LPWDTConfig0, esp32p4LPWDTWProtect, esp32p4LPWDTSWDConf, esp32p4LPWDTSWDWProtect)

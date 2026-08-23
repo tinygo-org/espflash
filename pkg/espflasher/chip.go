@@ -146,6 +146,13 @@ type chipDef struct {
 	// mechanism.
 	HardResetOTG func(f *Flasher) bool
 
+	// RTC_CNTL_OPTION1 register and its FORCE_DOWNLOAD_BOOT bit. The bit
+	// survives a reset (RTC domain), so Flasher.Reset clears it or the
+	// chip comes back up in download mode. 0 when not known for the chip.
+	// Reference: esptool/targets/esp32s3.py hard_reset().
+	ForceDownloadBootReg  uint32
+	ForceDownloadBootMask uint32
+
 	// ReadMAC reads the factory-programmed base MAC address from eFuse.
 	// Nil for chips (ESP8266) that don't expose it via this scheme.
 	ReadMAC func(f *Flasher) (net.HardwareAddr, error)

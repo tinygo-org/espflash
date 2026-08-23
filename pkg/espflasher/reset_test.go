@@ -2,6 +2,7 @@ package espflasher
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -290,3 +291,202 @@ func TestFlasherResetUSBJTAGChipUnchanged(t *testing.T) {
 
 	assert.NotEmpty(t, port.calls, "USB-Serial-JTAG chips must still use the DTR/RTS reset path")
 }
+
+// TestFlasherResetClearsForceDownloadBoot verifies Reset() clears the
+// force-download-boot bit; left set, the chip comes back up in download
+// mode instead of running the application.
+func TestFlasherResetClearsForceDownloadBoot(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		chip *chipDef
+		reg  uint32
+		mask uint32
+	}{
+		{"esp32c3", defESP32C3, esp32c3RTCCntlOption1Reg, esp32c3RTCCntlForceDownloadBoot},
+		{"esp32s3", defESP32S3, esp32s3RTCCntlOption1Reg, esp32s3RTCCntlForceDownloadBoot},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			type regWrite struct {
+				addr, value, mask uint32
+			}
+			var writes []regWrite
+			mc := &mockConnection{
+				writeRegFunc: func(addr, value, mask, delayUS uint32) error {
+					writes = append(writes, regWrite{addr, value, mask})
+					return nil
+				},
+			}
+			f := &Flasher{
+				conn:    mc,
+				port:    &recordingPort{},
+				opts:    &FlasherOptions{},
+				chip:    tt.chip,
+				usesUSB: true,
+			}
+
+			f.Reset()
+
+			assert.Contains(t, writes, regWrite{tt.reg, 0, tt.mask},
+				"Reset must clear the force-download-boot bit")
+		})
+	}
+}
+
+// TestFlasherResetClearsForceDownloadBootBeforeStubReboot verifies the clear
+// happens while the loader still answers commands.
+func TestFlasherResetClearsForceDownloadBootBeforeStubReboot(t *testing.T) {
+	var order []string
+	mc := &mockConnection{
+		stubMode: true,
+		writeRegFunc: func(addr, value, mask, delayUS uint32) error {
+			if addr == esp32c3RTCCntlOption1Reg {
+				order = append(order, "clear")
+			}
+			return nil
+		},
+		flashEndFunc: func(reboot bool) error {
+			order = append(order, "flashEnd")
+			return nil
+		},
+	}
+	f := &Flasher{
+		conn:    mc,
+		port:    &recordingPort{},
+		opts:    &FlasherOptions{},
+		chip:    defESP32C3,
+		usesUSB: true,
+	}
+
+	f.Reset()
+
+	require.Equal(t, []string{"clear", "flashEnd"}, order)
+}
+
+// TestFlasherResetForceDownloadBootFailureIsNonFatal verifies a failed clear
+// (e.g. secure download mode) doesn't stop the reset.
+func TestFlasherResetForceDownloadBootFailureIsNonFatal(t *testing.T) {
+	port := &recordingPort{}
+	mc := &mockConnection{
+		writeRegFunc: func(addr, value, mask, delayUS uint32) error {
+			return errors.New("write failed")
+		},
+	}
+	f := &Flasher{
+		conn:    mc,
+		port:    port,
+		opts:    &FlasherOptions{},
+		chip:    defESP32C3,
+		usesUSB: true,
+	}
+
+	f.Reset()
+
+	assert.NotEmpty(t, port.calls, "reset must still run when the clear fails")
+}
+
+// TestFlasherResetNoForceDownloadBootReg verifies chips without the register
+// skip the clear instead of writing to address 0.
+func TestFlasherResetNoForceDownloadBootReg(t *testing.T) {
+	writes := 0
+	mc := &mockConnection{
+		writeRegFunc: func(addr, value, mask, delayUS uint32) error {
+			writes++
+			return nil
+		},
+	}
+	f := &Flasher{
+		conn: mc,
+		port: &recordingPort{},
+		opts: &FlasherOptions{},
+		chip: defESP8266,
+	}
+
+	f.Reset()
+
+	assert.Equal(t, 0, writes, "chips without the register must not be written to")
+}
+
+// TestFlasherResetKeepsStubRunning verifies Reset() ends the session with
+// reboot=false. reboot=true means "reboot into the ROM bootloader", leaving
+// the chip in download mode with a re-enumerated (stale) port.
+func TestFlasherResetKeepsStubRunning(t *testing.T) {
+	var reboots []bool
+	port := &recordingPort{}
+	mc := &mockConnection{
+		stubMode: true,
+		flashEndFunc: func(reboot bool) error {
+			reboots = append(reboots, reboot)
+			return nil
+		},
+	}
+	f := &Flasher{
+		conn:    mc,
+		port:    port,
+		opts:    &FlasherOptions{},
+		chip:    defESP32C3,
+		usesUSB: true,
+	}
+
+	f.Reset()
+
+	require.Equal(t, []bool{false}, reboots, "must not reboot back into the ROM bootloader")
+	assert.NotEmpty(t, port.calls, "the hardware reset must still run")
+}
+
+// failingPort fails its modem-control writes, as a stale fd does after the
+// USB device re-enumerated.
+type failingPort struct {
+	recordingPort
+	err error
+}
+
+func (f *failingPort) SetDTR(dtr bool) error {
+	f.recordingPort.SetDTR(dtr) //nolint:errcheck
+	return f.err
+}
+
+func (f *failingPort) SetRTS(rts bool) error {
+	f.recordingPort.SetRTS(rts) //nolint:errcheck
+	return f.err
+}
+
+// TestHardResetReportsError verifies hardReset surfaces a failed write while
+// still running the full sequence, so EN isn't left asserted.
+func TestHardResetReportsError(t *testing.T) {
+	for _, usesUSB := range []bool{false, true} {
+		port := &failingPort{err: errors.New("input/output error")}
+
+		err := hardReset(port, usesUSB)
+
+		assert.Error(t, err, "usesUSB=%v", usesUSB)
+		assert.Equal(t, false, port.rtsCalls[len(port.rtsCalls)-1],
+			"the sequence must run to completion and release EN")
+	}
+}
+
+// TestFlasherResetReportsFailedReset verifies Reset() doesn't claim
+// "Device reset." when the DTR/RTS writes never reached the device.
+func TestFlasherResetReportsFailedReset(t *testing.T) {
+	var logged []string
+	f := &Flasher{
+		conn: &mockConnection{},
+		port: &failingPort{err: errors.New("input/output error")},
+		opts: &FlasherOptions{Logger: loggerFunc(func(format string, args ...interface{}) {
+			logged = append(logged, fmt.Sprintf(format, args...))
+		})},
+		chip:    defESP32C3,
+		usesUSB: true,
+	}
+
+	f.Reset()
+
+	require.NotEmpty(t, logged)
+	last := logged[len(logged)-1]
+	assert.Contains(t, last, "may not have been reset")
+	assert.NotContains(t, last, "Device reset.")
+}
+
+// loggerFunc adapts a function to the Logger interface.
+type loggerFunc func(format string, args ...interface{})
+
+func (l loggerFunc) Logf(format string, args ...interface{}) { l(format, args...) }

@@ -1169,14 +1169,22 @@ func (f *Flasher) ReadFlash(offset, size uint32, progress ProgressFunc) ([]byte,
 
 // Reset performs a hard reset of the device, causing it to run user code.
 func (f *Flasher) Reset() {
+	// Clear force-download-boot first, while the loader still answers
+	// commands: the bit survives the resets below, so leaving it set makes
+	// the chip boot into download mode instead of the application.
+	f.clearForceDownloadBoot()
+
 	if f.conn.isStub() {
-		// Tell the stub to cleanly exit flash mode and reboot.
-		// flashEnd(true) triggers a software reboot inside the stub.
+		// Exit flash mode but keep the stub running: reboot=true means
+		// "reboot into the ROM bootloader", which lands the chip in
+		// download mode and re-enumerates USB, leaving the reset below to
+		// toggle a stale fd. esptool also ends with reboot=False.
+		//
 		// For ROM bootloaders, skip flash_begin/flash_end — sending
 		// CMD_FLASH_BEGIN after a compressed download may interfere with
 		// the flash controller state at offset 0.
 		f.conn.flashBegin(0, 0, false) //nolint:errcheck
-		f.conn.flashEnd(true)          //nolint:errcheck
+		f.conn.flashEnd(false)         //nolint:errcheck
 		time.Sleep(50 * time.Millisecond)
 	}
 
@@ -1188,12 +1196,32 @@ func (f *Flasher) Reset() {
 		return
 	}
 
+	var err error
 	if f.usesUSB {
-		hardResetUSB(f.port)
+		err = hardResetUSB(f.port)
 	} else {
-		hardReset(f.port, false)
+		err = hardReset(f.port, false)
+	}
+	if err != nil {
+		// The DTR/RTS writes never reached the device, so don't claim a
+		// reset that most likely didn't happen.
+		f.logf("Warning: device may not have been reset: %v", err)
+		return
 	}
 	f.logf("Device reset.")
+}
+
+// clearForceDownloadBoot clears the force-download-boot bit for chips that
+// expose it. Non-fatal: the register is unwritable in secure download mode.
+// Mirrors esptool's ESP32S3ROM.hard_reset().
+func (f *Flasher) clearForceDownloadBoot() {
+	if f.chip == nil || f.chip.ForceDownloadBootReg == 0 {
+		return
+	}
+	err := f.conn.writeReg(f.chip.ForceDownloadBootReg, 0, f.chip.ForceDownloadBootMask, 0)
+	if err != nil {
+		f.logf("Warning: could not clear force-download-boot: %v", err)
+	}
 }
 
 // attachFlash attaches the SPI flash and configures parameters.

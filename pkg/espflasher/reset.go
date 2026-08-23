@@ -161,17 +161,29 @@ func usbJTAGSerialReset(port serial.Port) {
 }
 
 // hardReset performs a hardware reset (chip restarts and runs user code).
-func hardReset(port serial.Port, usesUSB bool) {
+//
+// It returns the first modem-control error but always runs the full
+// sequence, so a mid-sequence failure can't leave EN asserted. An error
+// usually means a stale fd (the USB device re-enumerated) and so a chip
+// that was never reset.
+func hardReset(port serial.Port, usesUSB bool) error {
+	var firstErr error
+	set := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
 	if usesUSB {
 		// On USB-JTAG/Serial, the peripheral latches DTR (GPIO0 state)
 		// at reset time. Ensure DTR=false so GPIO0=HIGH → normal boot,
 		// not bootloader mode.
-		port.SetDTR(false) //nolint:errcheck
+		set(port.SetDTR(false))
 	}
-	port.SetRTS(true) //nolint:errcheck // EN=LOW (chip in reset)
+	set(port.SetRTS(true)) // EN=LOW (chip in reset)
 	if usesUSB {
 		time.Sleep(200 * time.Millisecond)
-		port.SetRTS(false) //nolint:errcheck
+		set(port.SetRTS(false))
 		time.Sleep(200 * time.Millisecond)
 	} else {
 		time.Sleep(100 * time.Millisecond)
@@ -179,9 +191,10 @@ func hardReset(port serial.Port, usesUSB bool) {
 		// from a prior operation holds IO0 LOW at reset exit and the chip
 		// boots into the download-mode bootloader instead of the
 		// application. Matches esptool.py HardReset.
-		port.SetDTR(false) //nolint:errcheck
-		port.SetRTS(false) //nolint:errcheck
+		set(port.SetDTR(false))
+		set(port.SetRTS(false))
 	}
+	return firstErr
 }
 
 // String returns the string representation of the ResetMode.

@@ -73,14 +73,20 @@ var defESP32C6 = &chipDef{
 // during flash and resets the chip mid-operation.
 // Reference: esptool/targets/esp32c6.py _post_connect()
 func esp32c6PostConnect(f *Flasher) error {
-	uartDev, err := f.ReadRegister(esp32c6UARTDevBufNo)
-	if err != nil {
-		// In secure download mode, the register may be unreadable.
-		// Default to non-USB behavior (safe fallback).
-		return nil
+	// Prefer VID/PID (as esptool does); fall back to the ROM variable when
+	// the host reports none.
+	usbJTAG := f.usbInterfaceFromPort() == usbInterfaceSerialJTAG
+	if !usbJTAG {
+		uartDev, err := f.ReadRegister(esp32c6UARTDevBufNo)
+		if err != nil {
+			// In secure download mode, the register may be unreadable.
+			// Default to non-USB behavior (safe fallback).
+			return nil
+		}
+		usbJTAG = uartDev == esp32c6UARTDevBufNoUSBJTAGSerial
 	}
 
-	if uartDev == esp32c6UARTDevBufNoUSBJTAGSerial {
+	if usbJTAG {
 		f.usesUSB = true
 		f.logf("USB-JTAG/Serial interface detected, disabling watchdogs")
 		return disableWatchdogsLP(f, esp32c6LPWDTConfig0, esp32c6LPWDTWProtect, esp32c6LPWDTSWDConf, esp32c6LPWDTSWDWProtect)
