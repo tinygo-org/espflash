@@ -497,9 +497,26 @@ func (f *Flasher) detectChip() (*chipDef, error) {
 	// Otherwise, try to read the chip magic value to verify the chip type (ESP8266, ESP32, ESP32-S2)
 	magic, err := f.conn.readReg(chipDetectMagicRegAddr)
 	if err != nil {
-		// Only ESP32-S2 does not support chip id detection
-		// and supports secure download mode
-		f.logf("unable to read chip magic value. Defaulting to ESP32-S2: %s", err)
+		// esptool.py's loader.py only falls back to "ESP32-S2 in secure
+		// download mode" when the chip explicitly NAKs the read-register
+		// command (an UnsupportedCommandError / CommandError with a "command
+		// not implemented" status) — see connect()'s
+		// `except UnsupportedCommandError: chip_magic_value = None`. Any
+		// other failure (timeout, short/garbled response, checksum error)
+		// is a transient communication glitch, not a chip identity signal,
+		// and esptool.py lets it propagate as a real connection error
+		// instead of guessing a chip type. Treating every readReg error as
+		// "must be ESP32-S2" here previously caused real ESP32 boards to be
+		// misdetected as ESP32-S2 whenever a reset/sync happened to leave a
+		// bit of line noise on the wire, which then failed to load the
+		// (wrong) stub and produced a confusing "erase requires stub" error
+		// instead of a clear "couldn't detect chip" one.
+		var cmdErr *CommandError
+		if !errors.As(err, &cmdErr) || cmdErr.Status != 0xFF {
+			return nil, fmt.Errorf("unable to read chip magic value: %w", err)
+		}
+
+		f.logf("chip does not support register reads; assuming ESP32-S2 (secure download mode)")
 
 		// si may be nil here if readSecurityInfo also failed above; default
 		// SecureDownloadMode to false in that case rather than dereferencing.
@@ -579,10 +596,21 @@ func (f *Flasher) FlashImage(data []byte, offset uint32, progress ProgressFunc) 
 		return fmt.Errorf("attach flash: %w", err)
 	}
 
-	// Cap baud rate for UART-bridge chips prone to FIFO overflow.
-	if f.chip != nil && f.chip.MaxUARTFlashBaud > 0 && !f.usesUSB &&
+	// Cap baud rate for UART-bridge chips prone to FIFO overflow — but only
+	// in ROM bootloader mode. The cap exists because the ROM disables
+	// interrupts during flash page writes (SPI bus shared with cache),
+	// which can overrun the bridge's small UART RX FIFO. Once the stub
+	// loader is running, it buffers incoming data itself and does not have
+	// this problem: esptool.py raises the baud rate freely once its stub is
+	// up (and doesn't apply any chip-specific UART-bridge cap), confirmed
+	// empirically here too — 921600 baud ran cleanly over the same
+	// CP2102/CH340-style bridge once the stub was active. Applying the cap
+	// unconditionally (as before) silently overrode any higher
+	// FlashBaudRate the caller asked for even in stub mode, which is why
+	// raising -baudrate had no effect on flashing speed.
+	if f.chip != nil && f.chip.MaxUARTFlashBaud > 0 && !f.usesUSB && !f.conn.isStub() &&
 		f.opts.FlashBaudRate > f.chip.MaxUARTFlashBaud {
-		f.logf("Limiting flash baud rate to %d (UART bridge on %s)", f.chip.MaxUARTFlashBaud, f.chip.Name)
+		f.logf("Limiting flash baud rate to %d (UART bridge on %s, ROM bootloader)", f.chip.MaxUARTFlashBaud, f.chip.Name)
 		f.opts.FlashBaudRate = f.chip.MaxUARTFlashBaud
 	}
 
@@ -649,10 +677,21 @@ func (f *Flasher) FlashImages(images []ImagePart, progress ProgressFunc) error {
 		f.opts.FlashMode = "dout"
 	}
 
-	// Cap baud rate for UART-bridge chips prone to FIFO overflow.
-	if f.chip != nil && f.chip.MaxUARTFlashBaud > 0 && !f.usesUSB &&
+	// Cap baud rate for UART-bridge chips prone to FIFO overflow — but only
+	// in ROM bootloader mode. The cap exists because the ROM disables
+	// interrupts during flash page writes (SPI bus shared with cache),
+	// which can overrun the bridge's small UART RX FIFO. Once the stub
+	// loader is running, it buffers incoming data itself and does not have
+	// this problem: esptool.py raises the baud rate freely once its stub is
+	// up (and doesn't apply any chip-specific UART-bridge cap), confirmed
+	// empirically here too — 921600 baud ran cleanly over the same
+	// CP2102/CH340-style bridge once the stub was active. Applying the cap
+	// unconditionally (as before) silently overrode any higher
+	// FlashBaudRate the caller asked for even in stub mode, which is why
+	// raising -baudrate had no effect on flashing speed.
+	if f.chip != nil && f.chip.MaxUARTFlashBaud > 0 && !f.usesUSB && !f.conn.isStub() &&
 		f.opts.FlashBaudRate > f.chip.MaxUARTFlashBaud {
-		f.logf("Limiting flash baud rate to %d (UART bridge on %s)", f.chip.MaxUARTFlashBaud, f.chip.Name)
+		f.logf("Limiting flash baud rate to %d (UART bridge on %s, ROM bootloader)", f.chip.MaxUARTFlashBaud, f.chip.Name)
 		f.opts.FlashBaudRate = f.chip.MaxUARTFlashBaud
 	}
 
